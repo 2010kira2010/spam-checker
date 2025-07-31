@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: spam_checker_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: spamchecker
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spam_checker_app
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_HOST=192.168.1.2
+      - DB_PORT=5433
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=spamchecker
+      - JWT_SECRET=your-super-secret-jwt-key
+      - TESSERACT_PATH=/usr/bin/tesseract
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./.env:/app/.env
+
+  # Android emulator for Yandex AON
+  android-yandex:
+    image: budtmo/docker-android:emulator_11.0
+    container_name: spam_checker_android_yandex
+    privileged: true
+    environment:
+      - DEVICE=Samsung Galaxy S10
+      - DATAPARTITION=4g
+    ports:
+      - "6080:6080"  # noVNC
+      - "5554:5554"  # ADB
+    volumes:
+      - android_yandex_data:/data
+
+  # Android emulator for Kaspersky Who Calls
+  android-kaspersky:
+    image: budtmo/docker-android:emulator_11.0
+    container_name: spam_checker_android_kaspersky
+    privileged: true
+    environment:
+      - DEVICE=Samsung Galaxy S10
+      - DATAPARTITION=4g
+    ports:
+      - "6081:6080"  # noVNC
+      - "5556:5554"  # ADB
+    volumes:
+      - android_kaspersky_data:/data
+
+  # Android emulator for GetContact
+  android-getcontact:
+    image: budtmo/docker-android:emulator_11.0
+    container_name: spam_checker_android_getcontact
+    privileged: true
+    environment:
+      - DEVICE=Samsung Galaxy S10
+      - DATAPARTITION=4g
+    ports:
+      - "6082:6080"  # noVNC
+      - "5558:5554"  # ADB
+    volumes:
+      - android_getcontact_data:/data
+
+volumes:
+  postgres_data:
+  android_yandex_data:
+  android_kaspersky_data:
+  android_getcontact_data:
