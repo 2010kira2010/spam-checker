@@ -7,6 +7,7 @@ import { LocalizationProvider } from '@mui/x-date-pickers';
 import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
 import { observer } from 'mobx-react-lite';
 import axios from 'axios';
+import './i18n'; // Import i18n configuration
 
 // Stores
 import { authStore } from './stores/AuthStore';

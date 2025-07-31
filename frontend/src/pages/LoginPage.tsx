@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { observer } from 'mobx-react-lite';
 import { useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import {
     Box,
     Card,
@@ -15,6 +16,9 @@ import {
     Container,
     Stack,
     Divider,
+    FormControl,
+    Select,
+    MenuItem,
 } from '@mui/material';
 import {
     Visibility,
@@ -24,11 +28,13 @@ import {
     PhoneInTalk,
     Security,
     Speed,
+    Language,
 } from '@mui/icons-material';
 import { useSnackbar } from 'notistack';
 import { authStore } from '../stores/AuthStore';
 
 const LoginPage: React.FC = observer(() => {
+    const { t, i18n } = useTranslation();
     const navigate = useNavigate();
     const { enqueueSnackbar } = useSnackbar();
     const [showPassword, setShowPassword] = useState(false);
@@ -51,11 +57,15 @@ const LoginPage: React.FC = observer(() => {
         const success = await authStore.login(formData);
 
         if (success) {
-            enqueueSnackbar('Login successful!', { variant: 'success' });
+            enqueueSnackbar(t('common.success'), { variant: 'success' });
             navigate('/dashboard');
         } else {
-            enqueueSnackbar(authStore.error || 'Login failed', { variant: 'error' });
+            enqueueSnackbar(authStore.error || t('auth.loginFailed'), { variant: 'error' });
         }
+    };
+
+    const changeLanguage = (lng: string) => {
+        i18n.changeLanguage(lng);
     };
 
     const features = [
@@ -86,6 +96,24 @@ const LoginPage: React.FC = observer(() => {
                 overflow: 'hidden',
             }}
         >
+            {/* Language selector */}
+            <Box sx={{ position: 'absolute', top: 20, right: 20, zIndex: 1 }}>
+                <FormControl size="small">
+                    <Select
+                        value={i18n.language}
+                        onChange={(e) => changeLanguage(e.target.value)}
+                        startAdornment={<Language sx={{ mr: 1, color: 'text.secondary' }} />}
+                        sx={{
+                            backgroundColor: 'rgba(255, 255, 255, 0.1)',
+                            '& .MuiSelect-icon': { color: 'text.secondary' },
+                        }}
+                    >
+                        <MenuItem value="en">English</MenuItem>
+                        <MenuItem value="ru">Русский</MenuItem>
+                    </Select>
+                </FormControl>
+            </Box>
+
             {/* Background decoration */}
             <Box
                 sx={{
@@ -164,10 +192,10 @@ const LoginPage: React.FC = observer(() => {
                         >
                             <CardContent sx={{ p: 4 }}>
                                 <Typography variant="h4" sx={{ mb: 1, fontWeight: 600 }}>
-                                    Welcome Back
+                                    {t('auth.welcomeBack')}
                                 </Typography>
                                 <Typography variant="body2" sx={{ mb: 4, color: 'text.secondary' }}>
-                                    Sign in to continue to SpamChecker
+                                    {t('auth.signInToContinue')}
                                 </Typography>
 
                                 {authStore.error && (
@@ -180,7 +208,7 @@ const LoginPage: React.FC = observer(() => {
                                     <TextField
                                         fullWidth
                                         name="login"
-                                        label="Email or Username"
+                                        label={`${t('auth.email')} / ${t('auth.username')}`}
                                         value={formData.login}
                                         onChange={handleChange}
                                         margin="normal"
@@ -199,7 +227,7 @@ const LoginPage: React.FC = observer(() => {
                                     <TextField
                                         fullWidth
                                         name="password"
-                                        label="Password"
+                                        label={t('auth.password')}
                                         type={showPassword ? 'text' : 'password'}
                                         value={formData.password}
                                         onChange={handleChange}
@@ -240,7 +268,7 @@ const LoginPage: React.FC = observer(() => {
                                             },
                                         }}
                                     >
-                                        {authStore.isLoading ? 'Signing in...' : 'Sign In'}
+                                        {authStore.isLoading ? t('common.loading') : t('auth.signIn')}
                                     </Button>
 
                                     {authStore.isLoading && <LinearProgress sx={{ mb: 2 }} />}
