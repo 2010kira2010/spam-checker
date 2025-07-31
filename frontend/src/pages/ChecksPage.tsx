@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { observer } from 'mobx-react-lite';
+import { useTranslation } from 'react-i18next';
 import {
     Box,
     Card,
@@ -12,7 +13,6 @@ import {
     Dialog,
     DialogTitle,
     DialogContent,
-    DialogActions,
     Grid,
     Paper,
     IconButton,
@@ -27,10 +27,8 @@ import {
     TableRow,
     TablePagination,
     useTheme,
-    alpha,
 } from '@mui/material';
 import {
-    Search,
     PlayArrow,
     Refresh,
     Image as ImageIcon,
@@ -38,7 +36,6 @@ import {
     Warning,
     CheckCircle,
     AccessTime,
-    FilterList,
     Close,
 } from '@mui/icons-material';
 import { format } from 'date-fns';
@@ -61,6 +58,7 @@ interface CheckResult {
 }
 
 const ChecksPage: React.FC = observer(() => {
+    const { t } = useTranslation();
     const theme = useTheme();
     const { enqueueSnackbar } = useSnackbar();
 
@@ -96,7 +94,7 @@ const ChecksPage: React.FC = observer(() => {
             setResults(response.data.results || []);
             setTotalCount(response.data.count || 0);
         } catch (error) {
-            enqueueSnackbar('Failed to load check results', { variant: 'error' });
+            enqueueSnackbar(t('errors.loadFailed'), { variant: 'error' });
         } finally {
             setIsLoading(false);
         }
@@ -104,7 +102,7 @@ const ChecksPage: React.FC = observer(() => {
 
     const handleRealtimeCheck = async () => {
         if (!realtimeNumber.trim()) {
-            enqueueSnackbar('Please enter a phone number', { variant: 'warning' });
+            enqueueSnackbar(t('errors.requiredField'), { variant: 'warning' });
             return;
         }
 
@@ -117,24 +115,24 @@ const ChecksPage: React.FC = observer(() => {
             });
 
             setRealtimeResult(response.data);
-            enqueueSnackbar('Real-time check completed', { variant: 'success' });
+            enqueueSnackbar(t('notifications.checkCompleted'), { variant: 'success' });
         } catch (error: any) {
-            enqueueSnackbar(error.response?.data?.error || 'Failed to check number', { variant: 'error' });
+            enqueueSnackbar(error.response?.data?.error || t('errors.error'), { variant: 'error' });
         } finally {
             setRealtimeLoading(false);
         }
     };
 
     const handleCheckAll = async () => {
-        if (!window.confirm('This will check all active phone numbers. Continue?')) {
+        if (!window.confirm(t('confirmations.deleteConfirmation'))) {
             return;
         }
 
         try {
             await axios.post('/checks/all');
-            enqueueSnackbar('Check started for all active phones', { variant: 'info' });
+            enqueueSnackbar(t('checks.checkStartedAllPhones'), { variant: 'info' });
         } catch (error) {
-            enqueueSnackbar('Failed to start check', { variant: 'error' });
+            enqueueSnackbar(t('errors.error'), { variant: 'error' });
         }
     };
 
@@ -158,20 +156,20 @@ const ChecksPage: React.FC = observer(() => {
     return (
         <Box>
             <Typography variant="h4" sx={{ mb: 3, fontWeight: 600 }}>
-                Phone Checks
+                {t('checks.title')}
             </Typography>
 
             {/* Real-time Check Card */}
             <Card sx={{ mb: 4 }}>
                 <CardContent>
                     <Typography variant="h6" sx={{ mb: 3, fontWeight: 600 }}>
-                        Real-time Check
+                        {t('checks.realtimeCheck')}
                     </Typography>
                     <Grid container spacing={3} alignItems="flex-end">
                         <Grid item xs={12} md={6}>
                             <TextField
                                 fullWidth
-                                label="Phone Number"
+                                label={t('checks.phoneNumber')}
                                 placeholder="+7 (999) 123-45-67"
                                 value={realtimeNumber}
                                 onChange={(e) => setRealtimeNumber(e.target.value)}
@@ -193,7 +191,7 @@ const ChecksPage: React.FC = observer(() => {
                                 onClick={handleRealtimeCheck}
                                 disabled={realtimeLoading}
                             >
-                                {realtimeLoading ? 'Checking...' : 'Check Now'}
+                                {realtimeLoading ? t('checks.checking') : t('checks.checkNow')}
                             </Button>
                         </Grid>
                         <Grid item xs={12} md={3}>
@@ -204,7 +202,7 @@ const ChecksPage: React.FC = observer(() => {
                                 startIcon={<PlayArrow />}
                                 onClick={handleCheckAll}
                             >
-                                Check All Active
+                                {t('checks.checkAllActive')}
                             </Button>
                         </Grid>
                     </Grid>
@@ -213,7 +211,7 @@ const ChecksPage: React.FC = observer(() => {
                     {realtimeResult && (
                         <Box sx={{ mt: 3 }}>
                             <Alert severity="info" sx={{ mb: 2 }}>
-                                Results for {realtimeResult.phone_number}
+                                {t('checks.resultsFor', { number: realtimeResult.phone_number })}
                             </Alert>
                             <Grid container spacing={2}>
                                 {realtimeResult.results?.map((result: any, index: number) => (
@@ -235,11 +233,11 @@ const ChecksPage: React.FC = observer(() => {
                                                     {result.service}
                                                 </Typography>
                                                 {result.error ? (
-                                                    <Chip label="Error" size="small" color="error" />
+                                                    <Chip label={t('common.error')} size="small" color="error" />
                                                 ) : result.is_spam ? (
-                                                    <Chip label="Spam" size="small" color="warning" icon={<Warning />} />
+                                                    <Chip label={t('phones.spam')} size="small" color="warning" icon={<Warning />} />
                                                 ) : (
-                                                    <Chip label="Clean" size="small" color="success" icon={<CheckCircle />} />
+                                                    <Chip label={t('phones.clean')} size="small" color="success" icon={<CheckCircle />} />
                                                 )}
                                             </Box>
                                             {result.error ? (
@@ -254,7 +252,7 @@ const ChecksPage: React.FC = observer(() => {
                                                 </Box>
                                             ) : (
                                                 <Typography variant="body2" color="text.secondary">
-                                                    No spam keywords found
+                                                    {t('checks.noSpamKeywords')}
                                                 </Typography>
                                             )}
                                         </Paper>
@@ -270,10 +268,10 @@ const ChecksPage: React.FC = observer(() => {
             <Paper>
                 <Box sx={{ p: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                     <Typography variant="h6" sx={{ fontWeight: 600 }}>
-                        Check History
+                        {t('checks.checkHistory')}
                     </Typography>
                     <Box sx={{ display: 'flex', gap: 1 }}>
-                        <Tooltip title="Refresh">
+                        <Tooltip title={t('common.refresh')}>
                             <IconButton onClick={loadResults} disabled={isLoading}>
                                 <Refresh />
                             </IconButton>
@@ -285,12 +283,12 @@ const ChecksPage: React.FC = observer(() => {
                     <Table>
                         <TableHead>
                             <TableRow>
-                                <TableCell>Phone Number</TableCell>
-                                <TableCell>Service</TableCell>
-                                <TableCell>Status</TableCell>
-                                <TableCell>Keywords Found</TableCell>
-                                <TableCell>Checked At</TableCell>
-                                <TableCell align="center">Actions</TableCell>
+                                <TableCell>{t('checks.phoneNumber')}</TableCell>
+                                <TableCell>{t('checks.service')}</TableCell>
+                                <TableCell>{t('checks.status')}</TableCell>
+                                <TableCell>{t('checks.keywordsFound')}</TableCell>
+                                <TableCell>{t('checks.checkedAt')}</TableCell>
+                                <TableCell align="center">{t('common.actions')}</TableCell>
                             </TableRow>
                         </TableHead>
                         <TableBody>
@@ -304,7 +302,7 @@ const ChecksPage: React.FC = observer(() => {
                                 <TableRow>
                                     <TableCell colSpan={6} align="center">
                                         <Typography variant="body2" color="text.secondary">
-                                            No check results found
+                                            {t('checks.noCheckResults')}
                                         </Typography>
                                     </TableCell>
                                 </TableRow>
@@ -325,14 +323,14 @@ const ChecksPage: React.FC = observer(() => {
                                         <TableCell>
                                             {result.is_spam ? (
                                                 <Chip
-                                                    label="Spam"
+                                                    label={t('phones.spam')}
                                                     size="small"
                                                     color="error"
                                                     icon={<Warning />}
                                                 />
                                             ) : (
                                                 <Chip
-                                                    label="Clean"
+                                                    label={t('phones.clean')}
                                                     size="small"
                                                     color="success"
                                                     icon={<CheckCircle />}
@@ -361,7 +359,7 @@ const ChecksPage: React.FC = observer(() => {
                                                 </Box>
                                             ) : (
                                                 <Typography variant="caption" color="text.secondary">
-                                                    None
+                                                    —
                                                 </Typography>
                                             )}
                                         </TableCell>
@@ -374,7 +372,7 @@ const ChecksPage: React.FC = observer(() => {
                                             </Box>
                                         </TableCell>
                                         <TableCell align="center">
-                                            <Tooltip title="View Screenshot">
+                                            <Tooltip title={t('checks.viewScreenshot')}>
                                                 <IconButton
                                                     size="small"
                                                     onClick={() => handleViewScreenshot(result)}
@@ -423,7 +421,7 @@ const ChecksPage: React.FC = observer(() => {
                     <Box sx={{ textAlign: 'center', p: 2 }}>
                         <img
                             src={screenshotDialog.url}
-                            alt="Screenshot"
+                            alt={t('checks.screenshot')}
                             style={{
                                 maxWidth: '100%',
                                 maxHeight: '70vh',

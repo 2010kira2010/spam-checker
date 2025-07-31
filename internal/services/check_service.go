@@ -93,35 +93,26 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 
 	logrus.Infof("Checking %s on %s", phone.Number, service.Name)
 
-	// Connect to ADB
-	adbCmd := fmt.Sprintf("adb connect %s:%d", gateway.Host, gateway.Port)
-	if err := exec.Command("sh", "-c", adbCmd).Run(); err != nil {
-		return fmt.Errorf("failed to connect to ADB: %w", err)
-	}
-
 	// Open app based on service
 	appPackage, appActivity := s.getAppInfo(gateway.ServiceCode)
-	openCmd := fmt.Sprintf("adb -s %s:%d shell am start -n %s/%s",
-		gateway.Host, gateway.Port, appPackage, appActivity)
-	if err := exec.Command("sh", "-c", openCmd).Run(); err != nil {
+	if err := s.adbService.StartApp(gateway.ID, appPackage, appActivity); err != nil {
 		return fmt.Errorf("failed to open app: %w", err)
 	}
 
 	time.Sleep(3 * time.Second)
 
 	// Clear previous search
-	clearCmd := fmt.Sprintf("adb -s %s:%d shell input keyevent KEYCODE_CLEAR", gateway.Host, gateway.Port)
-	exec.Command("sh", "-c", clearCmd).Run()
+	if err := s.adbService.SendKeyEvent(gateway.ID, "KEYCODE_CLEAR"); err != nil {
+		logrus.Warnf("Failed to clear previous search: %v", err)
+	}
 
 	// Input phone number
-	inputCmd := fmt.Sprintf("adb -s %s:%d shell input text %s", gateway.Host, gateway.Port, phone.Number)
-	if err := exec.Command("sh", "-c", inputCmd).Run(); err != nil {
+	if err := s.adbService.InputText(gateway.ID, phone.Number); err != nil {
 		return fmt.Errorf("failed to input phone number: %w", err)
 	}
 
 	// Press search
-	searchCmd := fmt.Sprintf("adb -s %s:%d shell input keyevent KEYCODE_ENTER", gateway.Host, gateway.Port)
-	if err := exec.Command("sh", "-c", searchCmd).Run(); err != nil {
+	if err := s.adbService.SendKeyEvent(gateway.ID, "KEYCODE_ENTER"); err != nil {
 		return fmt.Errorf("failed to press search: %w", err)
 	}
 
@@ -129,7 +120,7 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	time.Sleep(5 * time.Second)
 
 	// Take screenshot
-	screenshot, err := s.takeScreenshot(gateway)
+	screenshot, err := s.adbService.TakeScreenshot(gateway.ID)
 	if err != nil {
 		return fmt.Errorf("failed to take screenshot: %w", err)
 	}

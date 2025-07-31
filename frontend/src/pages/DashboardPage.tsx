@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { observer } from 'mobx-react-lite';
+import { useTranslation } from 'react-i18next';
 import {
     Box,
     Grid,
@@ -50,6 +51,7 @@ interface StatCard {
 }
 
 const DashboardPage: React.FC = observer(() => {
+    const { t } = useTranslation();
     const theme = useTheme();
     const { enqueueSnackbar } = useSnackbar();
     const [isLoading, setIsLoading] = useState(true);
@@ -66,7 +68,7 @@ const DashboardPage: React.FC = observer(() => {
             await phoneStore.fetchPhones();
             setLastCheckTime(new Date());
         } catch (error) {
-            enqueueSnackbar('Failed to load dashboard data', { variant: 'error' });
+            enqueueSnackbar(t('errors.loadFailed'), { variant: 'error' });
         } finally {
             setIsLoading(false);
         }
@@ -74,34 +76,34 @@ const DashboardPage: React.FC = observer(() => {
 
     const statCards: StatCard[] = [
         {
-            title: 'Total Phones',
+            title: t('dashboard.totalPhones'),
             value: phoneStore.stats?.total_phones || 0,
             icon: <Phone />,
             color: theme.palette.primary.main,
-            subtitle: 'Registered numbers',
+            subtitle: t('dashboard.registeredNumbers'),
         },
         {
-            title: 'Active Phones',
+            title: t('dashboard.activePhones'),
             value: phoneStore.stats?.active_phones || 0,
             icon: <PhoneInTalk />,
             color: theme.palette.success.main,
             trend: 12,
-            subtitle: 'Being monitored',
+            subtitle: t('dashboard.beingMonitored'),
         },
         {
-            title: 'Spam Detected',
+            title: t('dashboard.spamDetected'),
             value: phoneStore.stats?.spam_phones || 0,
             icon: <Warning />,
             color: theme.palette.error.main,
             trend: -5,
-            subtitle: 'Marked as spam',
+            subtitle: t('dashboard.markedAsSpam'),
         },
         {
-            title: 'Clean Numbers',
+            title: t('dashboard.cleanNumbers'),
             value: phoneStore.stats?.clean_phones || 0,
             icon: <CheckCircle />,
             color: theme.palette.info.main,
-            subtitle: 'No spam detected',
+            subtitle: t('dashboard.noSpamDetected'),
         },
     ];
 
@@ -135,18 +137,18 @@ const DashboardPage: React.FC = observer(() => {
             <Box sx={{ mb: 4 }}>
                 <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2 }}>
                     <Typography variant="h4" sx={{ fontWeight: 600 }}>
-                        Dashboard
+                        {t('dashboard.title')}
                     </Typography>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
                         {lastCheckTime && (
                             <Chip
                                 icon={<AccessTime />}
-                                label={`Last update: ${format(lastCheckTime, 'HH:mm')}`}
+                                label={`${t('dashboard.lastUpdate')}: ${format(lastCheckTime, 'HH:mm')}`}
                                 size="small"
                                 variant="outlined"
                             />
                         )}
-                        <Tooltip title="Refresh data">
+                        <Tooltip title={t('common.refresh')}>
                             <IconButton onClick={loadDashboardData} disabled={isLoading}>
                                 <Refresh />
                             </IconButton>
@@ -228,7 +230,7 @@ const DashboardPage: React.FC = observer(() => {
                 <Grid item xs={12} md={8}>
                     <Paper sx={{ p: 3, height: 400 }}>
                         <Typography variant="h6" sx={{ mb: 3, fontWeight: 600 }}>
-                            Weekly Trend
+                            {t('dashboard.weeklyTrend')}
                         </Typography>
                         <ResponsiveContainer width="100%" height="85%">
                             <AreaChart data={weeklyTrend}>
@@ -259,6 +261,7 @@ const DashboardPage: React.FC = observer(() => {
                                     stroke={theme.palette.error.main}
                                     fillOpacity={1}
                                     fill="url(#colorSpam)"
+                                    name={t('phones.spam')}
                                 />
                                 <Area
                                     type="monotone"
@@ -267,6 +270,7 @@ const DashboardPage: React.FC = observer(() => {
                                     stroke={theme.palette.success.main}
                                     fillOpacity={1}
                                     fill="url(#colorClean)"
+                                    name={t('phones.clean')}
                                 />
                             </AreaChart>
                         </ResponsiveContainer>
@@ -277,7 +281,7 @@ const DashboardPage: React.FC = observer(() => {
                 <Grid item xs={12} md={4}>
                     <Paper sx={{ p: 3, height: 400 }}>
                         <Typography variant="h6" sx={{ mb: 3, fontWeight: 600 }}>
-                            Service Distribution
+                            {t('dashboard.serviceDistribution')}
                         </Typography>
                         <ResponsiveContainer width="100%" height="70%">
                             <PieChart>
@@ -320,7 +324,7 @@ const DashboardPage: React.FC = observer(() => {
             {/* Recent Activity */}
             <Paper sx={{ p: 3 }}>
                 <Typography variant="h6" sx={{ mb: 3, fontWeight: 600 }}>
-                    Recent Activity
+                    {t('dashboard.recentActivity')}
                 </Typography>
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                     {recentActivity.map((activity, index) => (
@@ -346,7 +350,7 @@ const DashboardPage: React.FC = observer(() => {
                                 <Chip label={activity.service} size="small" variant="outlined" />
                             </Box>
                             <Chip
-                                label={activity.status}
+                                label={t(`phones.${activity.status}`)}
                                 size="small"
                                 color={activity.status === 'spam' ? 'error' : 'success'}
                                 icon={activity.status === 'spam' ? <Warning /> : <CheckCircle />}

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { observer } from 'mobx-react-lite';
+import { useTranslation } from 'react-i18next';
 import {
     Box,
     Button,
@@ -48,6 +49,7 @@ interface PhoneFormData {
 }
 
 const PhonesPage: React.FC = observer(() => {
+    const { t } = useTranslation();
     const { enqueueSnackbar } = useSnackbar();
     const [searchQuery, setSearchQuery] = useState('');
     const [openDialog, setOpenDialog] = useState(false);
@@ -93,12 +95,12 @@ const PhonesPage: React.FC = observer(() => {
     };
 
     const handleDeletePhone = async (phone: any) => {
-        if (window.confirm(`Are you sure you want to delete ${phone.number}?`)) {
+        if (window.confirm(t('phones.confirmDelete', { number: phone.number }))) {
             const success = await phoneStore.deletePhone(phone.id);
             if (success) {
-                enqueueSnackbar('Phone deleted successfully', { variant: 'success' });
+                enqueueSnackbar(t('phones.phoneDeleted'), { variant: 'success' });
             } else {
-                enqueueSnackbar(phoneStore.error || 'Failed to delete phone', { variant: 'error' });
+                enqueueSnackbar(phoneStore.error || t('errors.deleteFailed'), { variant: 'error' });
             }
         }
         setAnchorEl(null);
@@ -108,18 +110,18 @@ const PhonesPage: React.FC = observer(() => {
         if (editingPhone) {
             const success = await phoneStore.updatePhone(editingPhone.id, formData);
             if (success) {
-                enqueueSnackbar('Phone updated successfully', { variant: 'success' });
+                enqueueSnackbar(t('phones.phoneUpdated'), { variant: 'success' });
                 setOpenDialog(false);
             } else {
-                enqueueSnackbar(phoneStore.error || 'Failed to update phone', { variant: 'error' });
+                enqueueSnackbar(phoneStore.error || t('errors.updateFailed'), { variant: 'error' });
             }
         } else {
             const success = await phoneStore.createPhone(formData);
             if (success) {
-                enqueueSnackbar('Phone created successfully', { variant: 'success' });
+                enqueueSnackbar(t('phones.phoneCreated'), { variant: 'success' });
                 setOpenDialog(false);
             } else {
-                enqueueSnackbar(phoneStore.error || 'Failed to create phone', { variant: 'error' });
+                enqueueSnackbar(phoneStore.error || t('errors.saveFailed'), { variant: 'error' });
             }
         }
     };
@@ -127,18 +129,18 @@ const PhonesPage: React.FC = observer(() => {
     const handleCheckPhone = async (phone: any) => {
         const success = await phoneStore.checkPhone(phone.id);
         if (success) {
-            enqueueSnackbar(`Check started for ${phone.number}`, { variant: 'info' });
+            enqueueSnackbar(t('phones.checkStarted', { number: phone.number }), { variant: 'info' });
         } else {
-            enqueueSnackbar(phoneStore.error || 'Failed to start check', { variant: 'error' });
+            enqueueSnackbar(phoneStore.error || t('errors.error'), { variant: 'error' });
         }
     };
 
     const handleCheckAll = async () => {
         const success = await phoneStore.checkAllPhones();
         if (success) {
-            enqueueSnackbar('Check started for all active phones', { variant: 'info' });
+            enqueueSnackbar(t('checks.checkStartedAllPhones'), { variant: 'info' });
         } else {
-            enqueueSnackbar(phoneStore.error || 'Failed to start check', { variant: 'error' });
+            enqueueSnackbar(phoneStore.error || t('errors.error'), { variant: 'error' });
         }
     };
 
@@ -147,30 +149,30 @@ const PhonesPage: React.FC = observer(() => {
 
         const result = await phoneStore.importPhones(selectedFile);
         if (result.success) {
-            enqueueSnackbar(`Imported ${result.imported} phones successfully`, { variant: 'success' });
+            enqueueSnackbar(t('phones.importSuccess', { count: result.imported }), { variant: 'success' });
             if (result.errors && result.errors.length > 0) {
-                enqueueSnackbar(`${result.errors.length} errors occurred during import`, { variant: 'warning' });
+                enqueueSnackbar(`${result.errors.length} ${t('errors.error')}`, { variant: 'warning' });
             }
             setImportDialogOpen(false);
             setSelectedFile(null);
         } else {
-            enqueueSnackbar('Failed to import phones', { variant: 'error' });
+            enqueueSnackbar(t('errors.importFailed'), { variant: 'error' });
         }
     };
 
     const handleExport = async () => {
         const success = await phoneStore.exportPhones();
         if (success) {
-            enqueueSnackbar('Phones exported successfully', { variant: 'success' });
+            enqueueSnackbar(t('phones.exportSuccess'), { variant: 'success' });
         } else {
-            enqueueSnackbar('Failed to export phones', { variant: 'error' });
+            enqueueSnackbar(t('errors.exportFailed'), { variant: 'error' });
         }
     };
 
     const columns: GridColDef[] = [
         {
             field: 'number',
-            headerName: 'Phone Number',
+            headerName: t('phones.phoneNumber'),
             flex: 1,
             minWidth: 150,
             renderCell: (params: GridRenderCellParams) => (
@@ -184,17 +186,17 @@ const PhonesPage: React.FC = observer(() => {
         },
         {
             field: 'description',
-            headerName: 'Description',
+            headerName: t('phones.description'),
             flex: 1.5,
             minWidth: 200,
         },
         {
             field: 'is_active',
-            headerName: 'Status',
+            headerName: t('common.status'),
             width: 120,
             renderCell: (params: GridRenderCellParams) => (
                 <Chip
-                    label={params.value ? 'Active' : 'Inactive'}
+                    label={params.value ? t('common.active') : t('common.inactive')}
                     size="small"
                     color={params.value ? 'success' : 'default'}
                     icon={params.value ? <CheckCircle /> : <Cancel />}
@@ -203,18 +205,18 @@ const PhonesPage: React.FC = observer(() => {
         },
         {
             field: 'check_results',
-            headerName: 'Last Check',
+            headerName: t('phones.lastCheck'),
             width: 150,
             renderCell: (params: GridRenderCellParams) => {
                 const results = params.value as any[];
                 if (!results || results.length === 0) {
-                    return <Typography variant="caption" color="text.secondary">Never checked</Typography>;
+                    return <Typography variant="caption" color="text.secondary">{t('phones.neverChecked')}</Typography>;
                 }
                 const lastResult = results[0];
                 const isSpam = lastResult.is_spam;
                 return (
                     <Chip
-                        label={isSpam ? 'Spam' : 'Clean'}
+                        label={isSpam ? t('phones.spam') : t('phones.clean')}
                         size="small"
                         color={isSpam ? 'error' : 'success'}
                         icon={isSpam ? <Warning /> : <CheckCircle />}
@@ -224,7 +226,7 @@ const PhonesPage: React.FC = observer(() => {
         },
         {
             field: 'created_at',
-            headerName: 'Created',
+            headerName: t('users.created'),
             width: 150,
             renderCell: (params: GridRenderCellParams) => (
                 <Typography variant="caption">
@@ -234,12 +236,12 @@ const PhonesPage: React.FC = observer(() => {
         },
         {
             field: 'actions',
-            headerName: 'Actions',
+            headerName: t('common.actions'),
             width: 120,
             sortable: false,
             renderCell: (params: GridRenderCellParams) => (
                 <Box>
-                    <Tooltip title="Check now">
+                    <Tooltip title={t('phones.checkNow')}>
                         <IconButton
                             size="small"
                             onClick={() => handleCheckPhone(params.row)}
@@ -269,13 +271,13 @@ const PhonesPage: React.FC = observer(() => {
             {/* Header */}
             <Box sx={{ mb: 4 }}>
                 <Typography variant="h4" sx={{ mb: 3, fontWeight: 600 }}>
-                    Phone Numbers
+                    {t('phones.title')}
                 </Typography>
 
                 {/* Actions Bar */}
                 <Box sx={{ display: 'flex', gap: 2, mb: 3, flexWrap: 'wrap' }}>
                     <TextField
-                        placeholder="Search phones..."
+                        placeholder={`${t('common.search')}...`}
                         value={searchQuery}
                         onChange={(e) => handleSearch(e.target.value)}
                         size="small"
@@ -296,14 +298,14 @@ const PhonesPage: React.FC = observer(() => {
                                 startIcon={<Add />}
                                 onClick={handleAddPhone}
                             >
-                                Add Phone
+                                {t('phones.addPhone')}
                             </Button>
                             <Button
                                 variant="outlined"
                                 startIcon={<FileUpload />}
                                 onClick={() => setImportDialogOpen(true)}
                             >
-                                Import
+                                {t('common.import')}
                             </Button>
                         </>
                     )}
@@ -313,7 +315,7 @@ const PhonesPage: React.FC = observer(() => {
                         startIcon={<FileDownload />}
                         onClick={handleExport}
                     >
-                        Export
+                        {t('common.export')}
                     </Button>
 
                     {authStore.isAdmin && (
@@ -323,16 +325,16 @@ const PhonesPage: React.FC = observer(() => {
                             startIcon={<PlayArrow />}
                             onClick={handleCheckAll}
                         >
-                            Check All
+                            {t('phones.checkAll')}
                         </Button>
                     )}
                 </Box>
 
                 {/* Stats */}
                 <Box sx={{ display: 'flex', gap: 2, mb: 3 }}>
-                    <Chip label={`Total: ${phoneStore.totalItems}`} />
-                    <Chip label={`Active: ${phoneStore.phones.filter(p => p.is_active).length}`} color="success" />
-                    <Chip label={`Inactive: ${phoneStore.phones.filter(p => !p.is_active).length}`} />
+                    <Chip label={`${t('phones.total')}: ${phoneStore.totalItems}`} />
+                    <Chip label={`${t('phones.active')}: ${phoneStore.phones.filter(p => p.is_active).length}`} color="success" />
+                    <Chip label={`${t('phones.inactive')}: ${phoneStore.phones.filter(p => !p.is_active).length}`} />
                 </Box>
             </Box>
 
@@ -375,12 +377,12 @@ const PhonesPage: React.FC = observer(() => {
             {/* Phone Form Dialog */}
             <Dialog open={openDialog} onClose={() => setOpenDialog(false)} maxWidth="sm" fullWidth>
                 <DialogTitle>
-                    {editingPhone ? 'Edit Phone' : 'Add Phone'}
+                    {editingPhone ? t('phones.editPhone') : t('phones.addPhone')}
                 </DialogTitle>
                 <DialogContent>
                     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 2 }}>
                         <TextField
-                            label="Phone Number"
+                            label={t('phones.phoneNumber')}
                             value={formData.number}
                             onChange={(e) => setFormData({ ...formData, number: e.target.value })}
                             fullWidth
@@ -388,7 +390,7 @@ const PhonesPage: React.FC = observer(() => {
                             helperText="Format: +7XXXXXXXXXX"
                         />
                         <TextField
-                            label="Description"
+                            label={t('phones.description')}
                             value={formData.description}
                             onChange={(e) => setFormData({ ...formData, description: e.target.value })}
                             fullWidth
@@ -402,24 +404,24 @@ const PhonesPage: React.FC = observer(() => {
                                     onChange={(e) => setFormData({ ...formData, is_active: e.target.checked })}
                                 />
                             }
-                            label="Active"
+                            label={t('common.active')}
                         />
                     </Box>
                 </DialogContent>
                 <DialogActions>
-                    <Button onClick={() => setOpenDialog(false)}>Cancel</Button>
+                    <Button onClick={() => setOpenDialog(false)}>{t('common.cancel')}</Button>
                     <Button onClick={handleSubmit} variant="contained">
-                        {editingPhone ? 'Update' : 'Create'}
+                        {editingPhone ? t('common.update') : t('common.create')}
                     </Button>
                 </DialogActions>
             </Dialog>
 
             {/* Import Dialog */}
             <Dialog open={importDialogOpen} onClose={() => setImportDialogOpen(false)} maxWidth="sm" fullWidth>
-                <DialogTitle>Import Phones</DialogTitle>
+                <DialogTitle>{t('phones.importPhones')}</DialogTitle>
                 <DialogContent>
                     <Alert severity="info" sx={{ mb: 2 }}>
-                        CSV file should have columns: number, description
+                        {t('phones.importInstructions')}
                     </Alert>
                     <input
                         type="file"
@@ -429,9 +431,9 @@ const PhonesPage: React.FC = observer(() => {
                     />
                 </DialogContent>
                 <DialogActions>
-                    <Button onClick={() => setImportDialogOpen(false)}>Cancel</Button>
+                    <Button onClick={() => setImportDialogOpen(false)}>{t('common.cancel')}</Button>
                     <Button onClick={handleImport} variant="contained" disabled={!selectedFile}>
-                        Import
+                        {t('common.import')}
                     </Button>
                 </DialogActions>
             </Dialog>
@@ -445,13 +447,13 @@ const PhonesPage: React.FC = observer(() => {
                 {canEdit && (
                     <MenuItem onClick={() => handleEditPhone(selectedPhone)}>
                         <Edit sx={{ mr: 1, fontSize: 20 }} />
-                        Edit
+                        {t('common.edit')}
                     </MenuItem>
                 )}
                 {authStore.isAdmin && (
                     <MenuItem onClick={() => handleDeletePhone(selectedPhone)} sx={{ color: 'error.main' }}>
                         <Delete sx={{ mr: 1, fontSize: 20 }} />
-                        Delete
+                        {t('common.delete')}
                     </MenuItem>
                 )}
             </Menu>

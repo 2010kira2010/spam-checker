@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { observer } from 'mobx-react-lite';
+import { useTranslation } from 'react-i18next';
 import {
     Box,
     Card,
@@ -68,6 +69,7 @@ interface UserFormData {
 }
 
 const UsersPage: React.FC = observer(() => {
+    const { t } = useTranslation();
     const { enqueueSnackbar } = useSnackbar();
     const [users, setUsers] = useState<User[]>([]);
     const [isLoading, setIsLoading] = useState(true);
@@ -97,7 +99,7 @@ const UsersPage: React.FC = observer(() => {
             const response = await axios.get('/users');
             setUsers(response.data.users || []);
         } catch (error) {
-            enqueueSnackbar('Failed to load users', { variant: 'error' });
+            enqueueSnackbar(t('errors.loadFailed'), { variant: 'error' });
         } finally {
             setIsLoading(false);
         }
@@ -129,57 +131,57 @@ const UsersPage: React.FC = observer(() => {
 
     const handleDeleteUser = async (user: User) => {
         if (user.id === authStore.user?.id) {
-            enqueueSnackbar('You cannot delete your own account', { variant: 'error' });
+            enqueueSnackbar(t('users.cannotDeleteSelf'), { variant: 'error' });
             return;
         }
 
-        if (!window.confirm(`Are you sure you want to delete user ${user.username}?`)) {
+        if (!window.confirm(t('users.confirmDelete', { username: user.username }))) {
             return;
         }
 
         try {
             await axios.delete(`/users/${user.id}`);
-            enqueueSnackbar('User deleted successfully', { variant: 'success' });
+            enqueueSnackbar(t('users.userDeleted'), { variant: 'success' });
             loadUsers();
         } catch (error) {
-            enqueueSnackbar('Failed to delete user', { variant: 'error' });
+            enqueueSnackbar(t('errors.deleteFailed'), { variant: 'error' });
         }
     };
 
     const handleSubmit = async () => {
         if (!formData.username || !formData.email) {
-            enqueueSnackbar('Please fill in all required fields', { variant: 'error' });
+            enqueueSnackbar(t('errors.requiredField'), { variant: 'error' });
             return;
         }
 
         if (!editingUser && !formData.password) {
-            enqueueSnackbar('Password is required for new users', { variant: 'error' });
+            enqueueSnackbar(t('errors.requiredField'), { variant: 'error' });
             return;
         }
 
         try {
             if (editingUser) {
                 await axios.put(`/users/${editingUser.id}`, formData);
-                enqueueSnackbar('User updated successfully', { variant: 'success' });
+                enqueueSnackbar(t('users.userUpdated'), { variant: 'success' });
             } else {
                 await axios.post('/users', formData);
-                enqueueSnackbar('User created successfully', { variant: 'success' });
+                enqueueSnackbar(t('users.userCreated'), { variant: 'success' });
             }
             setDialogOpen(false);
             loadUsers();
         } catch (error: any) {
-            enqueueSnackbar(error.response?.data?.error || 'Failed to save user', { variant: 'error' });
+            enqueueSnackbar(error.response?.data?.error || t('errors.saveFailed'), { variant: 'error' });
         }
     };
 
     const handleChangePassword = async () => {
         if (passwordData.newPassword !== passwordData.confirmPassword) {
-            enqueueSnackbar('Passwords do not match', { variant: 'error' });
+            enqueueSnackbar(t('users.passwordsDoNotMatch'), { variant: 'error' });
             return;
         }
 
         if (passwordData.newPassword.length < 6) {
-            enqueueSnackbar('Password must be at least 6 characters', { variant: 'error' });
+            enqueueSnackbar(t('users.passwordMinLength'), { variant: 'error' });
             return;
         }
 
@@ -187,11 +189,11 @@ const UsersPage: React.FC = observer(() => {
             await axios.put(`/users/${passwordData.userId}/password`, {
                 password: passwordData.newPassword,
             });
-            enqueueSnackbar('Password changed successfully', { variant: 'success' });
+            enqueueSnackbar(t('users.passwordChanged'), { variant: 'success' });
             setChangePasswordDialog(false);
             setPasswordData({ userId: 0, newPassword: '', confirmPassword: '' });
         } catch (error) {
-            enqueueSnackbar('Failed to change password', { variant: 'error' });
+            enqueueSnackbar(t('errors.updateFailed'), { variant: 'error' });
         }
     };
 
@@ -221,14 +223,14 @@ const UsersPage: React.FC = observer(() => {
         <Box>
             <Box sx={{ mb: 4, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <Typography variant="h4" sx={{ fontWeight: 600 }}>
-                    User Management
+                    {t('users.title')}
                 </Typography>
                 <Button
                     variant="contained"
                     startIcon={<PersonAdd />}
                     onClick={handleAddUser}
                 >
-                    Add User
+                    {t('users.addUser')}
                 </Button>
             </Box>
 
@@ -240,7 +242,7 @@ const UsersPage: React.FC = observer(() => {
                             {users.length}
                         </Typography>
                         <Typography variant="body2" color="text.secondary">
-                            Total Users
+                            {t('users.totalUsers')}
                         </Typography>
                     </CardContent>
                 </Card>
@@ -250,7 +252,7 @@ const UsersPage: React.FC = observer(() => {
                             {users.filter(u => u.is_active).length}
                         </Typography>
                         <Typography variant="body2" color="text.secondary">
-                            Active Users
+                            {t('users.activeUsers')}
                         </Typography>
                     </CardContent>
                 </Card>
@@ -260,7 +262,7 @@ const UsersPage: React.FC = observer(() => {
                             {users.filter(u => u.role === 'admin').length}
                         </Typography>
                         <Typography variant="body2" color="text.secondary">
-                            Administrators
+                            {t('users.administrators')}
                         </Typography>
                     </CardContent>
                 </Card>
@@ -271,12 +273,12 @@ const UsersPage: React.FC = observer(() => {
                 <Table>
                     <TableHead>
                         <TableRow>
-                            <TableCell>User</TableCell>
-                            <TableCell>Email</TableCell>
-                            <TableCell>Role</TableCell>
-                            <TableCell>Status</TableCell>
-                            <TableCell>Created</TableCell>
-                            <TableCell align="right">Actions</TableCell>
+                            <TableCell>{t('users.user')}</TableCell>
+                            <TableCell>{t('users.email')}</TableCell>
+                            <TableCell>{t('users.role')}</TableCell>
+                            <TableCell>{t('users.status')}</TableCell>
+                            <TableCell>{t('users.created')}</TableCell>
+                            <TableCell align="right">{t('common.actions')}</TableCell>
                         </TableRow>
                     </TableHead>
                     <TableBody>
@@ -301,7 +303,7 @@ const UsersPage: React.FC = observer(() => {
                                 <TableCell>
                                     <Chip
                                         icon={getRoleIcon(user.role)}
-                                        label={user.role}
+                                        label={t(`users.${user.role}`)}
                                         size="small"
                                         color={getRoleColor(user.role)}
                                     />
@@ -309,7 +311,7 @@ const UsersPage: React.FC = observer(() => {
                                 <TableCell>
                                     <Chip
                                         icon={user.is_active ? <CheckCircle /> : <Cancel />}
-                                        label={user.is_active ? 'Active' : 'Inactive'}
+                                        label={user.is_active ? t('users.active') : t('users.inactive')}
                                         size="small"
                                         color={user.is_active ? 'success' : 'default'}
                                     />
@@ -320,7 +322,7 @@ const UsersPage: React.FC = observer(() => {
                                     </Typography>
                                 </TableCell>
                                 <TableCell align="right">
-                                    <Tooltip title="Change Password">
+                                    <Tooltip title={t('users.changePassword')}>
                                         <IconButton
                                             size="small"
                                             onClick={() => {
@@ -331,12 +333,12 @@ const UsersPage: React.FC = observer(() => {
                                             <Lock />
                                         </IconButton>
                                     </Tooltip>
-                                    <Tooltip title="Edit">
+                                    <Tooltip title={t('common.edit')}>
                                         <IconButton size="small" onClick={() => handleEditUser(user)}>
                                             <Edit />
                                         </IconButton>
                                     </Tooltip>
-                                    <Tooltip title="Delete">
+                                    <Tooltip title={t('common.delete')}>
                                         <IconButton
                                             size="small"
                                             onClick={() => handleDeleteUser(user)}
@@ -356,12 +358,12 @@ const UsersPage: React.FC = observer(() => {
             {/* User Dialog */}
             <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="sm" fullWidth>
                 <DialogTitle>
-                    {editingUser ? 'Edit User' : 'Add New User'}
+                    {editingUser ? t('users.editUser') : t('users.addUser')}
                 </DialogTitle>
                 <DialogContent>
                     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 2 }}>
                         <TextField
-                            label="Username"
+                            label={t('auth.username')}
                             value={formData.username}
                             onChange={(e) => setFormData({ ...formData, username: e.target.value })}
                             fullWidth
@@ -375,7 +377,7 @@ const UsersPage: React.FC = observer(() => {
                             }}
                         />
                         <TextField
-                            label="Email"
+                            label={t('auth.email')}
                             type="email"
                             value={formData.email}
                             onChange={(e) => setFormData({ ...formData, email: e.target.value })}
@@ -391,13 +393,13 @@ const UsersPage: React.FC = observer(() => {
                         />
                         {!editingUser && (
                             <TextField
-                                label="Password"
+                                label={t('auth.password')}
                                 type="password"
                                 value={formData.password}
                                 onChange={(e) => setFormData({ ...formData, password: e.target.value })}
                                 fullWidth
                                 required
-                                helperText="Minimum 6 characters"
+                                helperText={t('users.passwordMinLength')}
                                 InputProps={{
                                     startAdornment: (
                                         <InputAdornment position="start">
@@ -408,15 +410,15 @@ const UsersPage: React.FC = observer(() => {
                             />
                         )}
                         <FormControl fullWidth>
-                            <InputLabel>Role</InputLabel>
+                            <InputLabel>{t('users.role')}</InputLabel>
                             <Select
                                 value={formData.role}
-                                label="Role"
+                                label={t('users.role')}
                                 onChange={(e) => setFormData({ ...formData, role: e.target.value as any })}
                             >
-                                <MenuItem value="user">User</MenuItem>
-                                <MenuItem value="supervisor">Supervisor</MenuItem>
-                                <MenuItem value="admin">Administrator</MenuItem>
+                                <MenuItem value="user">{t('users.user')}</MenuItem>
+                                <MenuItem value="supervisor">{t('users.supervisor')}</MenuItem>
+                                <MenuItem value="admin">{t('users.admin')}</MenuItem>
                             </Select>
                         </FormControl>
                         <FormControlLabel
@@ -426,19 +428,19 @@ const UsersPage: React.FC = observer(() => {
                                     onChange={(e) => setFormData({ ...formData, is_active: e.target.checked })}
                                 />
                             }
-                            label="Active"
+                            label={t('common.active')}
                         />
                         {editingUser && (
                             <Alert severity="info">
-                                Leave password field empty to keep the current password
+                                {t('users.changePassword')}
                             </Alert>
                         )}
                     </Box>
                 </DialogContent>
                 <DialogActions>
-                    <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
+                    <Button onClick={() => setDialogOpen(false)}>{t('common.cancel')}</Button>
                     <Button onClick={handleSubmit} variant="contained">
-                        {editingUser ? 'Update' : 'Create'}
+                        {editingUser ? t('common.update') : t('common.create')}
                     </Button>
                 </DialogActions>
             </Dialog>
@@ -450,11 +452,11 @@ const UsersPage: React.FC = observer(() => {
                 maxWidth="xs"
                 fullWidth
             >
-                <DialogTitle>Change Password</DialogTitle>
+                <DialogTitle>{t('users.changePassword')}</DialogTitle>
                 <DialogContent>
                     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 2 }}>
                         <TextField
-                            label="New Password"
+                            label={t('users.newPassword')}
                             type="password"
                             value={passwordData.newPassword}
                             onChange={(e) => setPasswordData({ ...passwordData, newPassword: e.target.value })}
@@ -462,7 +464,7 @@ const UsersPage: React.FC = observer(() => {
                             required
                         />
                         <TextField
-                            label="Confirm Password"
+                            label={t('users.confirmPassword')}
                             type="password"
                             value={passwordData.confirmPassword}
                             onChange={(e) => setPasswordData({ ...passwordData, confirmPassword: e.target.value })}
@@ -472,9 +474,9 @@ const UsersPage: React.FC = observer(() => {
                     </Box>
                 </DialogContent>
                 <DialogActions>
-                    <Button onClick={() => setChangePasswordDialog(false)}>Cancel</Button>
+                    <Button onClick={() => setChangePasswordDialog(false)}>{t('common.cancel')}</Button>
                     <Button onClick={handleChangePassword} variant="contained">
-                        Change Password
+                        {t('users.changePassword')}
                     </Button>
                 </DialogActions>
             </Dialog>

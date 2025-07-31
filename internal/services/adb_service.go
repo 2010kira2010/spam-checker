@@ -2,21 +2,26 @@ package services
 
 import (
 	"fmt"
-	"os/exec"
+	"os"
 	"spam-checker/internal/models"
 	"strings"
 	"time"
 
+	"github.com/electricbubble/gadb"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
 
 type ADBService struct {
-	db *gorm.DB
+	db      *gorm.DB
+	clients map[uint]*gadb.Device
 }
 
 func NewADBService(db *gorm.DB) *ADBService {
-	return &ADBService{db: db}
+	return &ADBService{
+		db:      db,
+		clients: make(map[uint]*gadb.Device),
+	}
 }
 
 // CreateGateway creates a new ADB gateway
@@ -72,10 +77,54 @@ func (s *ADBService) UpdateGateway(id uint, updates map[string]interface{}) erro
 
 // DeleteGateway deletes a gateway
 func (s *ADBService) DeleteGateway(id uint) error {
+	// Close connection if exists
+	if client, exists := s.clients[id]; exists {
+		client.Close()
+		delete(s.clients, id)
+	}
+
 	if err := s.db.Delete(&models.ADBGateway{}, id).Error; err != nil {
 		return fmt.Errorf("failed to delete gateway: %w", err)
 	}
 	return nil
+}
+
+// getOrCreateClient gets or creates ADB client for gateway
+func (s *ADBService) getOrCreateClient(gateway *models.ADBGateway) (*gadb.Device, error) {
+	// Check if client already exists
+	if client, exists := s.clients[gateway.ID]; exists {
+		// Test if connection is still alive
+		if _, err := client.DeviceInfo(); err == nil {
+			return client, nil
+		}
+		// Connection is dead, remove it
+		client.Close()
+		delete(s.clients, gateway.ID)
+	}
+
+	// Create new ADB client
+	adbClient, err := gadb.NewClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ADB client: %w", err)
+	}
+
+	// Connect to device
+	address := fmt.Sprintf("%s:%d", gateway.Host, gateway.Port)
+	err = adbClient.Connect(address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to device: %w", err)
+	}
+
+	// Get device
+	device, err := adbClient.Device(gadb.WithSerial(address))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get device: %w", err)
+	}
+
+	// Store client
+	s.clients[gateway.ID] = device
+
+	return device, nil
 }
 
 // UpdateGatewayStatus checks and updates gateway status
@@ -85,24 +134,23 @@ func (s *ADBService) UpdateGatewayStatus(gatewayID uint) error {
 		return err
 	}
 
-	// Test ADB connection
 	status := "offline"
 	deviceID := ""
 
-	// Connect to ADB
-	connectCmd := fmt.Sprintf("adb connect %s:%d", gateway.Host, gateway.Port)
-	output, err := exec.Command("sh", "-c", connectCmd).Output()
-	if err == nil && strings.Contains(string(output), "connected") {
-		// Get device ID
-		devicesCmd := fmt.Sprintf("adb devices | grep %s:%d", gateway.Host, gateway.Port)
-		devOutput, err := exec.Command("sh", "-c", devicesCmd).Output()
+	// Try to connect and get device info
+	device, err := s.getOrCreateClient(gateway)
+	if err == nil {
+		// Get device info to verify connection
+		info, err := device.DeviceInfo()
 		if err == nil {
-			parts := strings.Fields(string(devOutput))
-			if len(parts) >= 2 && parts[1] == "device" {
-				status = "online"
-				deviceID = parts[0]
-			}
+			status = "online"
+			deviceID = fmt.Sprintf("%s:%d", gateway.Host, gateway.Port)
+			logrus.Infof("Device info: %+v", info)
+		} else {
+			logrus.Errorf("Failed to get device info: %v", err)
 		}
+	} else {
+		logrus.Errorf("Failed to connect to gateway %s: %v", gateway.Name, err)
 	}
 
 	// Update status
@@ -150,16 +198,46 @@ func (s *ADBService) InstallAPK(gatewayID uint, apkPath string) error {
 		return fmt.Errorf("gateway %s is not online", gateway.Name)
 	}
 
-	// Install APK
-	installCmd := fmt.Sprintf("adb -s %s install -r %s", gateway.DeviceID, apkPath)
-	output, err := exec.Command("sh", "-c", installCmd).CombinedOutput()
+	// Get device client
+	device, err := s.getOrCreateClient(gateway)
 	if err != nil {
-		return fmt.Errorf("failed to install APK: %v - %s", err, string(output))
+		return fmt.Errorf("failed to get device client: %w", err)
 	}
 
-	if !strings.Contains(string(output), "Success") {
-		return fmt.Errorf("APK installation failed: %s", string(output))
+	// Open APK file
+	apkFile, err := os.Open(apkPath)
+	if err != nil {
+		return fmt.Errorf("failed to open APK file: %w", err)
 	}
+	defer apkFile.Close()
+
+	// Get file info for progress tracking
+	apkInfo, err := apkFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get APK file info: %w", err)
+	}
+
+	// Push and install APK
+	remotePath := fmt.Sprintf("/data/local/tmp/%s", apkInfo.Name())
+
+	// Push APK to device
+	err = device.Push(apkFile, remotePath, apkInfo.ModTime())
+	if err != nil {
+		return fmt.Errorf("failed to push APK: %w", err)
+	}
+
+	// Install APK
+	output, err := device.RunShellCommand(fmt.Sprintf("pm install -r %s", remotePath))
+	if err != nil {
+		return fmt.Errorf("failed to install APK: %w", err)
+	}
+
+	if !strings.Contains(output, "Success") {
+		return fmt.Errorf("APK installation failed: %s", output)
+	}
+
+	// Clean up remote file
+	device.RunShellCommand(fmt.Sprintf("rm %s", remotePath))
 
 	logrus.Infof("APK installed successfully on gateway %s", gateway.Name)
 
@@ -178,37 +256,65 @@ func (s *ADBService) ExecuteCommand(gatewayID uint, command string) (string, err
 		return "", fmt.Errorf("gateway %s is not online", gateway.Name)
 	}
 
-	// Execute command
-	adbCmd := fmt.Sprintf("adb -s %s %s", gateway.DeviceID, command)
-	output, err := exec.Command("sh", "-c", adbCmd).CombinedOutput()
+	// Get device client
+	device, err := s.getOrCreateClient(gateway)
 	if err != nil {
-		return "", fmt.Errorf("failed to execute command: %v - %s", err, string(output))
+		return "", fmt.Errorf("failed to get device client: %w", err)
 	}
 
-	return string(output), nil
+	// Execute command
+	output, err := device.RunShellCommand(command)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute command: %w", err)
+	}
+
+	return output, nil
 }
 
 // GetDeviceInfo gets device information
 func (s *ADBService) GetDeviceInfo(gatewayID uint) (map[string]string, error) {
 	info := make(map[string]string)
 
-	// Get basic props
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get device client
+	device, err := s.getOrCreateClient(gateway)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get device client: %w", err)
+	}
+
+	// Get device info from gadb
+	deviceInfo, err := device.DeviceInfo()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get device info: %w", err)
+	}
+
+	// Convert DeviceInfo to map
+	info["product"] = deviceInfo.Product
+	info["model"] = deviceInfo.Model
+	info["device"] = deviceInfo.Device
+	info["features"] = strings.Join(deviceInfo.Features, ", ")
+	info["abi"] = deviceInfo.ABI
+
+	// Get additional properties
 	props := []string{
-		"ro.product.model",
-		"ro.product.manufacturer",
 		"ro.build.version.release",
 		"ro.build.version.sdk",
+		"ro.product.manufacturer",
 	}
 
 	for _, prop := range props {
-		output, err := s.ExecuteCommand(gatewayID, fmt.Sprintf("shell getprop %s", prop))
+		output, err := device.RunShellCommand(fmt.Sprintf("getprop %s", prop))
 		if err == nil {
 			info[prop] = strings.TrimSpace(output)
 		}
 	}
 
 	// Get battery info
-	batteryOutput, err := s.ExecuteCommand(gatewayID, "shell dumpsys battery")
+	batteryOutput, err := device.RunShellCommand("dumpsys battery")
 	if err == nil {
 		lines := strings.Split(batteryOutput, "\n")
 		for _, line := range lines {
@@ -222,7 +328,7 @@ func (s *ADBService) GetDeviceInfo(gatewayID uint) (map[string]string, error) {
 	}
 
 	// Get screen resolution
-	wmOutput, err := s.ExecuteCommand(gatewayID, "shell wm size")
+	wmOutput, err := device.RunShellCommand("wm size")
 	if err == nil {
 		if strings.Contains(wmOutput, "Physical size:") {
 			parts := strings.Split(wmOutput, ":")
@@ -237,13 +343,28 @@ func (s *ADBService) GetDeviceInfo(gatewayID uint) (map[string]string, error) {
 
 // RestartDevice restarts Android device
 func (s *ADBService) RestartDevice(gatewayID uint) error {
-	_, err := s.ExecuteCommand(gatewayID, "reboot")
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	// Get device client
+	device, err := s.getOrCreateClient(gateway)
+	if err != nil {
+		return fmt.Errorf("failed to get device client: %w", err)
+	}
+
+	// Reboot device
+	err = device.Reboot()
 	if err != nil {
 		return fmt.Errorf("failed to restart device: %w", err)
 	}
 
 	// Update status to offline (will be updated when device comes back online)
 	s.db.Model(&models.ADBGateway{}).Where("id = ?", gatewayID).Update("status", "restarting")
+
+	// Remove client from map
+	delete(s.clients, gatewayID)
 
 	return nil
 }
@@ -263,15 +384,114 @@ func (s *ADBService) ClearAppData(gatewayID uint, serviceCode string) error {
 		return fmt.Errorf("unknown service code: %s", serviceCode)
 	}
 
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	// Get device client
+	device, err := s.getOrCreateClient(gateway)
+	if err != nil {
+		return fmt.Errorf("failed to get device client: %w", err)
+	}
+
 	// Clear app data
-	_, err := s.ExecuteCommand(gatewayID, fmt.Sprintf("shell pm clear %s", appPackage))
+	output, err := device.RunShellCommand(fmt.Sprintf("pm clear %s", appPackage))
 	if err != nil {
 		return fmt.Errorf("failed to clear app data: %w", err)
+	}
+
+	if !strings.Contains(output, "Success") {
+		return fmt.Errorf("failed to clear app data: %s", output)
 	}
 
 	logrus.Infof("App data cleared for %s on gateway %d", appPackage, gatewayID)
 
 	return nil
+}
+
+// TakeScreenshot takes a screenshot from device
+func (s *ADBService) TakeScreenshot(gatewayID uint) ([]byte, error) {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get device client
+	device, err := s.getOrCreateClient(gateway)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get device client: %w", err)
+	}
+
+	// Take screenshot using gadb
+	screenshot, err := device.Screenshot()
+	if err != nil {
+		return nil, fmt.Errorf("failed to take screenshot: %w", err)
+	}
+
+	return screenshot, nil
+}
+
+// InputText inputs text on device
+func (s *ADBService) InputText(gatewayID uint, text string) error {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	// Get device client
+	device, err := s.getOrCreateClient(gateway)
+	if err != nil {
+		return fmt.Errorf("failed to get device client: %w", err)
+	}
+
+	// Input text
+	_, err = device.RunShellCommand(fmt.Sprintf("input text '%s'", text))
+	return err
+}
+
+// SendKeyEvent sends key event to device
+func (s *ADBService) SendKeyEvent(gatewayID uint, keyCode string) error {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	// Get device client
+	device, err := s.getOrCreateClient(gateway)
+	if err != nil {
+		return fmt.Errorf("failed to get device client: %w", err)
+	}
+
+	// Send key event
+	_, err = device.RunShellCommand(fmt.Sprintf("input keyevent %s", keyCode))
+	return err
+}
+
+// StartApp starts app on device
+func (s *ADBService) StartApp(gatewayID uint, packageName, activityName string) error {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	// Get device client
+	device, err := s.getOrCreateClient(gateway)
+	if err != nil {
+		return fmt.Errorf("failed to get device client: %w", err)
+	}
+
+	// Start app
+	_, err = device.RunShellCommand(fmt.Sprintf("am start -n %s/%s", packageName, activityName))
+	return err
+}
+
+// CloseAllConnections closes all ADB connections
+func (s *ADBService) CloseAllConnections() {
+	for id, client := range s.clients {
+		client.Close()
+		delete(s.clients, id)
+	}
 }
 
 // MonitorGateways continuously monitors gateway statuses

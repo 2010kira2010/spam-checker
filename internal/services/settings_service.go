@@ -287,3 +287,194 @@ func (s *SettingsService) ExportSettings() ([]byte, error) {
 
 	return json.MarshalIndent(settings, "", "  ")
 }
+
+// GetSpamKeywords gets all spam keywords
+func (s *SettingsService) GetSpamKeywords() ([]models.SpamKeyword, error) {
+	var keywords []models.SpamKeyword
+	if err := s.db.Preload("Service").Order("keyword").Find(&keywords).Error; err != nil {
+		return nil, fmt.Errorf("failed to get spam keywords: %w", err)
+	}
+	return keywords, nil
+}
+
+// CreateSpamKeyword creates a new spam keyword
+func (s *SettingsService) CreateSpamKeyword(keyword *models.SpamKeyword) error {
+	// Check if keyword already exists
+	var existing models.SpamKeyword
+	err := s.db.Where("keyword = ? AND (service_id IS NULL OR service_id = ?)",
+		keyword.Keyword, keyword.ServiceID).First(&existing).Error
+
+	if err == nil {
+		return errors.New("keyword already exists")
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("failed to check existing keyword: %w", err)
+	}
+
+	if err := s.db.Create(keyword).Error; err != nil {
+		return fmt.Errorf("failed to create spam keyword: %w", err)
+	}
+
+	return nil
+}
+
+// UpdateSpamKeyword updates a spam keyword
+func (s *SettingsService) UpdateSpamKeyword(id uint, updates map[string]interface{}) error {
+	// Check if keyword exists
+	var keyword models.SpamKeyword
+	if err := s.db.First(&keyword, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("keyword not found")
+		}
+		return fmt.Errorf("failed to get keyword: %w", err)
+	}
+
+	// Check for duplicate if keyword is being updated
+	if newKeyword, ok := updates["keyword"].(string); ok && newKeyword != keyword.Keyword {
+		var existing models.SpamKeyword
+		query := s.db.Where("keyword = ? AND id != ?", newKeyword, id)
+
+		// Check service_id constraint
+		if serviceID, ok := updates["service_id"]; ok {
+			if serviceID == nil {
+				query = query.Where("service_id IS NULL")
+			} else {
+				query = query.Where("service_id = ?", serviceID)
+			}
+		} else {
+			if keyword.ServiceID == nil {
+				query = query.Where("service_id IS NULL")
+			} else {
+				query = query.Where("service_id = ?", keyword.ServiceID)
+			}
+		}
+
+		if err := query.First(&existing).Error; err == nil {
+			return errors.New("keyword already exists")
+		}
+	}
+
+	if err := s.db.Model(&models.SpamKeyword{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		return fmt.Errorf("failed to update spam keyword: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteSpamKeyword deletes a spam keyword
+func (s *SettingsService) DeleteSpamKeyword(id uint) error {
+	result := s.db.Delete(&models.SpamKeyword{}, id)
+	if result.Error != nil {
+		return fmt.Errorf("failed to delete spam keyword: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return errors.New("keyword not found")
+	}
+	return nil
+}
+
+// GetCheckSchedules gets all check schedules
+func (s *SettingsService) GetCheckSchedules() ([]models.CheckSchedule, error) {
+	var schedules []models.CheckSchedule
+	if err := s.db.Order("name").Find(&schedules).Error; err != nil {
+		return nil, fmt.Errorf("failed to get check schedules: %w", err)
+	}
+	return schedules, nil
+}
+
+// CreateCheckSchedule creates a new check schedule
+func (s *SettingsService) CreateCheckSchedule(schedule *models.CheckSchedule) error {
+	// Validate cron expression
+	if err := s.validateCronExpression(schedule.CronExpression); err != nil {
+		return fmt.Errorf("invalid cron expression: %w", err)
+	}
+
+	// Check if name already exists
+	var existing models.CheckSchedule
+	if err := s.db.Where("name = ?", schedule.Name).First(&existing).Error; err == nil {
+		return errors.New("schedule with this name already exists")
+	}
+
+	if err := s.db.Create(schedule).Error; err != nil {
+		return fmt.Errorf("failed to create check schedule: %w", err)
+	}
+
+	return nil
+}
+
+// UpdateCheckSchedule updates a check schedule
+func (s *SettingsService) UpdateCheckSchedule(id uint, updates map[string]interface{}) error {
+	// Check if schedule exists
+	var schedule models.CheckSchedule
+	if err := s.db.First(&schedule, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("schedule not found")
+		}
+		return fmt.Errorf("failed to get schedule: %w", err)
+	}
+
+	// Validate cron expression if it's being updated
+	if cronExpr, ok := updates["cron_expression"].(string); ok {
+		if err := s.validateCronExpression(cronExpr); err != nil {
+			return fmt.Errorf("invalid cron expression: %w", err)
+		}
+	}
+
+	// Check for duplicate name if name is being updated
+	if newName, ok := updates["name"].(string); ok && newName != schedule.Name {
+		var existing models.CheckSchedule
+		if err := s.db.Where("name = ? AND id != ?", newName, id).First(&existing).Error; err == nil {
+			return errors.New("schedule with this name already exists")
+		}
+	}
+
+	if err := s.db.Model(&models.CheckSchedule{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		return fmt.Errorf("failed to update check schedule: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteCheckSchedule deletes a check schedule
+func (s *SettingsService) DeleteCheckSchedule(id uint) error {
+	result := s.db.Delete(&models.CheckSchedule{}, id)
+	if result.Error != nil {
+		return fmt.Errorf("failed to delete check schedule: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return errors.New("schedule not found")
+	}
+	return nil
+}
+
+// validateCronExpression validates a cron expression
+func (s *SettingsService) validateCronExpression(expr string) error {
+	// Simple validation for common patterns
+	validPatterns := []string{
+		"@hourly",
+		"@daily",
+		"@weekly",
+		"@monthly",
+		"@yearly",
+		"@annually",
+	}
+
+	// Check if it's a predefined pattern
+	for _, pattern := range validPatterns {
+		if expr == pattern {
+			return nil
+		}
+	}
+
+	// Basic validation for standard cron format
+	// Format: minute hour day month weekday
+	// Example: "0 */6 * * *" (every 6 hours)
+	// This is a simplified validation
+	if expr == "" {
+		return errors.New("cron expression cannot be empty")
+	}
+
+	// More complex validation could be added here
+	// For now, we accept any non-empty string that doesn't match predefined patterns
+
+	return nil
+}
