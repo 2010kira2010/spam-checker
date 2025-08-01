@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"spam-checker/internal/config"
 	"spam-checker/internal/models"
 	"spam-checker/internal/services"
 	"time"
@@ -18,9 +19,10 @@ type CheckScheduler struct {
 	notificationService *services.NotificationService
 	db                  *gorm.DB
 	jobs                map[uint]*gocron.Job
+	cfg                 *config.Config
 }
 
-func NewCheckScheduler(db *gorm.DB, checkService *services.CheckService, phoneService *services.PhoneService, notificationService *services.NotificationService) *CheckScheduler {
+func NewCheckScheduler(db *gorm.DB, checkService *services.CheckService, phoneService *services.PhoneService, notificationService *services.NotificationService, cfg *config.Config) *CheckScheduler {
 	return &CheckScheduler{
 		scheduler:           gocron.NewScheduler(),
 		checkService:        checkService,
@@ -28,6 +30,7 @@ func NewCheckScheduler(db *gorm.DB, checkService *services.CheckService, phoneSe
 		notificationService: notificationService,
 		db:                  db,
 		jobs:                make(map[uint]*gocron.Job),
+		cfg:                 cfg,
 	}
 }
 
@@ -43,7 +46,7 @@ func (s *CheckScheduler) Start() {
 
 	// Monitor gateway statuses every 5 minutes
 	s.scheduler.Every(5).Minutes().Do(func() {
-		adbService := services.NewADBService(s.db)
+		adbService := services.NewADBService(s.db, s.cfg)
 		if err := adbService.UpdateAllGatewayStatuses(); err != nil {
 			logrus.Errorf("Failed to update gateway statuses: %v", err)
 		}

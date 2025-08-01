@@ -1,23 +1,54 @@
 package services
 
 import (
+	"archive/tar"
+	"bytes"
+	"context"
 	"fmt"
-	"os/exec"
+	"io"
+	"os"
+	"path/filepath"
+	"spam-checker/internal/config"
 	"spam-checker/internal/models"
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
 
 type ADBService struct {
-	db *gorm.DB
+	db           *gorm.DB
+	dockerClient *client.Client
+	cfg          *config.Config
 }
 
-func NewADBService(db *gorm.DB) *ADBService {
+func NewADBService(db *gorm.DB, cfg *config.Config) *ADBService {
+	return NewADBServiceWithConfig(db, cfg)
+}
+
+func NewADBServiceWithConfig(db *gorm.DB, cfg *config.Config) *ADBService {
+	// Initialize Docker client
+	dockerHost := "unix:///var/run/docker.sock"
+	if cfg != nil && cfg.Docker.Host != "" {
+		dockerHost = cfg.Docker.Host
+	}
+
+	dockerClient, err := client.NewClientWithOpts(
+		client.WithHost(dockerHost),
+		client.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		logrus.Errorf("Failed to create Docker client: %v", err)
+	}
+
 	return &ADBService{
-		db: db,
+		db:           db,
+		dockerClient: dockerClient,
+		cfg:          cfg,
 	}
 }
 
@@ -88,21 +119,35 @@ func (s *ADBService) UpdateGatewayStatus(gatewayID uint) error {
 	}
 
 	status := "offline"
-	deviceID := ""
+	containerName := s.getContainerName(gateway)
 
-	// Format device address
-	deviceAddr := s.getDeviceAddress(gateway)
+	// Check if Docker client is available
+	if s.dockerClient == nil {
+		logrus.Error("Docker client is not initialized")
+		return fmt.Errorf("Docker client is not initialized")
+	}
 
-	// Try to connect
-	cmd := exec.Command("adb", "connect", deviceAddr)
-	output, err := cmd.CombinedOutput()
-	if err == nil && strings.Contains(string(output), "connected") {
-		// Check device state
-		cmd = exec.Command("adb", "-s", deviceAddr, "get-state")
-		stateOutput, err := cmd.CombinedOutput()
-		if err == nil && strings.TrimSpace(string(stateOutput)) == "device" {
-			status = "online"
-			deviceID = deviceAddr
+	// Check if container is running
+	ctx := context.Background()
+	containers, err := s.dockerClient.ContainerList(ctx, container.ListOptions{})
+	if err != nil {
+		logrus.Errorf("Failed to list containers: %v", err)
+		return err
+	}
+
+	for _, cont := range containers {
+		for _, name := range cont.Names {
+			// Container names in Docker have leading slash
+			if strings.TrimPrefix(name, "/") == containerName {
+				if cont.State == "running" {
+					// Test ADB connection inside container
+					output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
+					if err == nil && strings.Contains(output, "emulator") {
+						status = "online"
+					}
+				}
+				break
+			}
 		}
 	}
 
@@ -110,7 +155,7 @@ func (s *ADBService) UpdateGatewayStatus(gatewayID uint) error {
 	now := time.Now()
 	updates := map[string]interface{}{
 		"status":    status,
-		"device_id": deviceID,
+		"device_id": containerName,
 		"last_ping": &now,
 	}
 
@@ -118,7 +163,7 @@ func (s *ADBService) UpdateGatewayStatus(gatewayID uint) error {
 		return fmt.Errorf("failed to update gateway status: %w", err)
 	}
 
-	logrus.Infof("Gateway %s status updated: %s", gateway.Name, status)
+	logrus.Infof("Gateway %s (%s) status updated: %s", gateway.Name, containerName, status)
 
 	return nil
 }
@@ -139,35 +184,6 @@ func (s *ADBService) UpdateAllGatewayStatuses() error {
 	return nil
 }
 
-// InstallAPK installs APK on gateway
-func (s *ADBService) InstallAPK(gatewayID uint, apkPath string) error {
-	gateway, err := s.GetGatewayByID(gatewayID)
-	if err != nil {
-		return err
-	}
-
-	if gateway.Status != "online" {
-		return fmt.Errorf("gateway %s is not online", gateway.Name)
-	}
-
-	deviceAddr := s.getDeviceAddress(gateway)
-
-	// Install APK
-	cmd := exec.Command("adb", "-s", deviceAddr, "install", "-r", apkPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to install APK: %w, output: %s", err, string(output))
-	}
-
-	if !strings.Contains(string(output), "Success") {
-		return fmt.Errorf("APK installation failed: %s", string(output))
-	}
-
-	logrus.Infof("APK installed successfully on gateway %s", gateway.Name)
-
-	return nil
-}
-
 // ExecuteCommand executes ADB command on gateway
 func (s *ADBService) ExecuteCommand(gatewayID uint, command string) (string, error) {
 	gateway, err := s.GetGatewayByID(gatewayID)
@@ -179,17 +195,13 @@ func (s *ADBService) ExecuteCommand(gatewayID uint, command string) (string, err
 		return "", fmt.Errorf("gateway %s is not online", gateway.Name)
 	}
 
-	deviceAddr := s.getDeviceAddress(gateway)
+	containerName := s.getContainerName(gateway)
 
-	// Execute shell command
-	args := append([]string{"-s", deviceAddr, "shell"}, strings.Fields(command)...)
-	cmd := exec.Command("adb", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("failed to execute command: %w, output: %s", err, string(output))
-	}
+	// Execute command inside container
+	fullCommand := []string{"adb", "shell"}
+	fullCommand = append(fullCommand, strings.Fields(command)...)
 
-	return string(output), nil
+	return s.executeInContainer(containerName, fullCommand)
 }
 
 // GetDeviceInfo gets device information
@@ -201,13 +213,12 @@ func (s *ADBService) GetDeviceInfo(gatewayID uint) (map[string]string, error) {
 		return nil, err
 	}
 
-	deviceAddr := s.getDeviceAddress(gateway)
+	containerName := s.getContainerName(gateway)
 
 	// Get device state
-	cmd := exec.Command("adb", "-s", deviceAddr, "get-state")
-	output, err := cmd.CombinedOutput()
+	output, err := s.executeInContainer(containerName, []string{"adb", "get-state"})
 	if err == nil {
-		info["state"] = strings.TrimSpace(string(output))
+		info["state"] = strings.TrimSpace(output)
 	}
 
 	// Get device properties
@@ -221,18 +232,16 @@ func (s *ADBService) GetDeviceInfo(gatewayID uint) (map[string]string, error) {
 	}
 
 	for key, prop := range props {
-		cmd = exec.Command("adb", "-s", deviceAddr, "shell", "getprop", prop)
-		output, err = cmd.CombinedOutput()
+		output, err = s.executeInContainer(containerName, []string{"adb", "shell", "getprop", prop})
 		if err == nil {
-			info[key] = strings.TrimSpace(string(output))
+			info[key] = strings.TrimSpace(output)
 		}
 	}
 
 	// Get battery info
-	cmd = exec.Command("adb", "-s", deviceAddr, "shell", "dumpsys", "battery")
-	output, err = cmd.CombinedOutput()
+	output, err = s.executeInContainer(containerName, []string{"adb", "shell", "dumpsys", "battery"})
 	if err == nil {
-		lines := strings.Split(string(output), "\n")
+		lines := strings.Split(output, "\n")
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
 			if strings.HasPrefix(line, "level:") {
@@ -240,7 +249,6 @@ func (s *ADBService) GetDeviceInfo(gatewayID uint) (map[string]string, error) {
 			} else if strings.HasPrefix(line, "temperature:") {
 				temp := strings.TrimSpace(strings.TrimPrefix(line, "temperature:"))
 				if tempInt := strings.TrimSpace(temp); tempInt != "" {
-					// Battery temperature is in tenths of degrees Celsius
 					info["battery_temperature"] = tempInt
 				}
 			}
@@ -248,12 +256,10 @@ func (s *ADBService) GetDeviceInfo(gatewayID uint) (map[string]string, error) {
 	}
 
 	// Get screen resolution
-	cmd = exec.Command("adb", "-s", deviceAddr, "shell", "wm", "size")
-	output, err = cmd.CombinedOutput()
+	output, err = s.executeInContainer(containerName, []string{"adb", "shell", "wm", "size"})
 	if err == nil {
-		outputStr := string(output)
-		if idx := strings.Index(outputStr, "Physical size:"); idx != -1 {
-			size := strings.TrimSpace(outputStr[idx+14:])
+		if idx := strings.Index(output, "Physical size:"); idx != -1 {
+			size := strings.TrimSpace(output[idx+14:])
 			if endIdx := strings.Index(size, "\n"); endIdx != -1 {
 				size = size[:endIdx]
 			}
@@ -271,17 +277,246 @@ func (s *ADBService) RestartDevice(gatewayID uint) error {
 		return err
 	}
 
-	deviceAddr := s.getDeviceAddress(gateway)
+	containerName := s.getContainerName(gateway)
 
 	// Reboot device
-	cmd := exec.Command("adb", "-s", deviceAddr, "reboot")
-	err = cmd.Run()
+	_, err = s.executeInContainer(containerName, []string{"adb", "reboot"})
 	if err != nil {
 		return fmt.Errorf("failed to restart device: %w", err)
 	}
 
 	// Update status to restarting
 	s.db.Model(&models.ADBGateway{}).Where("id = ?", gatewayID).Update("status", "restarting")
+
+	return nil
+}
+
+// InstallAPK installs APK on gateway
+func (s *ADBService) InstallAPK(gatewayID uint, apkPath string) error {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	if gateway.Status != "online" {
+		return fmt.Errorf("gateway %s is not online", gateway.Name)
+	}
+
+	containerName := s.getContainerName(gateway)
+
+	// Read APK file
+	apkFile, err := os.Open(apkPath)
+	if err != nil {
+		return fmt.Errorf("failed to open APK file: %w", err)
+	}
+	defer apkFile.Close()
+
+	// Get file info
+	fileInfo, err := apkFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	// Create tar archive
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	// Add file to tar
+	header := &tar.Header{
+		Name: "app.apk",
+		Mode: 0644,
+		Size: fileInfo.Size(),
+	}
+
+	if err := tw.WriteHeader(header); err != nil {
+		return fmt.Errorf("failed to write tar header: %w", err)
+	}
+
+	if _, err := io.Copy(tw, apkFile); err != nil {
+		return fmt.Errorf("failed to write file to tar: %w", err)
+	}
+
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("failed to close tar writer: %w", err)
+	}
+
+	// Copy to container
+	ctx := context.Background()
+	err = s.dockerClient.CopyToContainer(ctx, containerName, "/tmp/", &buf, container.CopyToContainerOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to copy APK to container: %w", err)
+	}
+
+	// Install APK
+	output, err := s.executeInContainer(containerName, []string{"adb", "install", "-r", "/tmp/app.apk"})
+	if err != nil {
+		return fmt.Errorf("failed to install APK: %w, output: %s", err, output)
+	}
+
+	if !strings.Contains(output, "Success") {
+		return fmt.Errorf("APK installation failed: %s", output)
+	}
+
+	// Clean up
+	s.executeInContainer(containerName, []string{"rm", "/tmp/app.apk"})
+
+	logrus.Infof("APK installed successfully on gateway %s", gateway.Name)
+
+	return nil
+}
+
+// TakeScreenshot takes a screenshot from device
+func (s *ADBService) TakeScreenshot(gatewayID uint) ([]byte, error) {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return nil, err
+	}
+
+	containerName := s.getContainerName(gateway)
+
+	// Take screenshot inside container and save to file
+	_, err = s.executeInContainer(containerName, []string{"adb", "shell", "screencap", "-p", "/sdcard/screenshot.png"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to take screenshot: %w", err)
+	}
+
+	// Pull screenshot from device to container filesystem
+	_, err = s.executeInContainer(containerName, []string{"adb", "pull", "/sdcard/screenshot.png", "/tmp/screenshot.png"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to pull screenshot: %w", err)
+	}
+
+	// Read screenshot from container
+	ctx := context.Background()
+	reader, _, err := s.dockerClient.CopyFromContainer(ctx, containerName, "/tmp/screenshot.png")
+	if err != nil {
+		return nil, fmt.Errorf("failed to copy screenshot from container: %w", err)
+	}
+	defer reader.Close()
+
+	// Extract from tar
+	tr := tar.NewReader(reader)
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to read tar: %w", err)
+		}
+
+		if header.Name == "screenshot.png" || filepath.Base(header.Name) == "screenshot.png" {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read screenshot data: %w", err)
+			}
+
+			// Clean up
+			s.executeInContainer(containerName, []string{"rm", "/tmp/screenshot.png"})
+			s.executeInContainer(containerName, []string{"adb", "shell", "rm", "/sdcard/screenshot.png"})
+
+			return data, nil
+		}
+	}
+
+	return nil, fmt.Errorf("screenshot not found in tar archive")
+}
+
+// InputText inputs text on device
+func (s *ADBService) InputText(gatewayID uint, text string) error {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	containerName := s.getContainerName(gateway)
+
+	// Escape special characters for shell
+	text = strings.ReplaceAll(text, "'", "'\"'\"'")
+
+	// Input text
+	_, err = s.executeInContainer(containerName, []string{"adb", "shell", "input", "text", "'" + text + "'"})
+	if err != nil {
+		return fmt.Errorf("failed to input text: %w", err)
+	}
+
+	return nil
+}
+
+// SendKeyEvent sends key event to device
+func (s *ADBService) SendKeyEvent(gatewayID uint, keyCode string) error {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	containerName := s.getContainerName(gateway)
+
+	// Send key event
+	_, err = s.executeInContainer(containerName, []string{"adb", "shell", "input", "keyevent", keyCode})
+	if err != nil {
+		return fmt.Errorf("failed to send key event: %w", err)
+	}
+
+	return nil
+}
+
+// StartApp starts app on device
+func (s *ADBService) StartApp(gatewayID uint, packageName, activityName string) error {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	containerName := s.getContainerName(gateway)
+
+	// Start app
+	output, err := s.executeInContainer(containerName, []string{"adb", "shell", "am", "start", "-n", packageName + "/" + activityName})
+	if err != nil {
+		return fmt.Errorf("failed to start app: %w, output: %s", err, output)
+	}
+
+	return nil
+}
+
+// SimulateIncomingCall simulates incoming call
+func (s *ADBService) SimulateIncomingCall(gatewayID uint, phoneNumber string) error {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	containerName := s.getContainerName(gateway)
+
+	// Simulate incoming call using emulator console
+	output, err := s.executeInContainer(containerName, []string{"adb", "emu", "gsm", "call", phoneNumber})
+	if err != nil {
+		return fmt.Errorf("failed to simulate call: %w, output: %s", err, output)
+	}
+
+	logrus.Infof("Simulated incoming call from %s on gateway %s", phoneNumber, gateway.Name)
+
+	return nil
+}
+
+// EndCall ends current call
+func (s *ADBService) EndCall(gatewayID uint) error {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	containerName := s.getContainerName(gateway)
+
+	// End call using emulator console
+	output, err := s.executeInContainer(containerName, []string{"adb", "emu", "gsm", "cancel", "inbound"})
+	if err != nil {
+		// Try key event as fallback
+		return s.SendKeyEvent(gatewayID, "KEYCODE_ENDCALL")
+	}
+
+	logrus.Infof("Ended call on gateway %s: %s", gateway.Name, output)
 
 	return nil
 }
@@ -306,223 +541,19 @@ func (s *ADBService) ClearAppData(gatewayID uint, serviceCode string) error {
 		return err
 	}
 
-	deviceAddr := s.getDeviceAddress(gateway)
+	containerName := s.getContainerName(gateway)
 
 	// Clear app data
-	cmd := exec.Command("adb", "-s", deviceAddr, "shell", "pm", "clear", appPackage)
-	output, err := cmd.CombinedOutput()
+	output, err := s.executeInContainer(containerName, []string{"adb", "shell", "pm", "clear", appPackage})
 	if err != nil {
-		return fmt.Errorf("failed to clear app data: %w, output: %s", err, string(output))
+		return fmt.Errorf("failed to clear app data: %w, output: %s", err, output)
 	}
 
-	if !strings.Contains(string(output), "Success") {
-		return fmt.Errorf("failed to clear app data: %s", string(output))
+	if !strings.Contains(output, "Success") {
+		return fmt.Errorf("failed to clear app data: %s", output)
 	}
 
 	logrus.Infof("App data cleared for %s on gateway %d", appPackage, gatewayID)
-
-	return nil
-}
-
-// TakeScreenshot takes a screenshot from device
-func (s *ADBService) TakeScreenshot(gatewayID uint) ([]byte, error) {
-	gateway, err := s.GetGatewayByID(gatewayID)
-	if err != nil {
-		return nil, err
-	}
-
-	deviceAddr := s.getDeviceAddress(gateway)
-
-	// Take screenshot to stdout
-	cmd := exec.Command("adb", "-s", deviceAddr, "exec-out", "screencap", "-p")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to take screenshot: %w", err)
-	}
-
-	return output, nil
-}
-
-// InputText inputs text on device
-func (s *ADBService) InputText(gatewayID uint, text string) error {
-	gateway, err := s.GetGatewayByID(gatewayID)
-	if err != nil {
-		return err
-	}
-
-	deviceAddr := s.getDeviceAddress(gateway)
-
-	// Escape special characters for shell
-	text = strings.ReplaceAll(text, "'", "'\"'\"'")
-
-	// Input text
-	cmd := exec.Command("adb", "-s", deviceAddr, "shell", "input", "text", "'"+text+"'")
-	err = cmd.Run()
-	if err != nil {
-		return fmt.Errorf("failed to input text: %w", err)
-	}
-
-	return nil
-}
-
-// SendKeyEvent sends key event to device
-func (s *ADBService) SendKeyEvent(gatewayID uint, keyCode string) error {
-	gateway, err := s.GetGatewayByID(gatewayID)
-	if err != nil {
-		return err
-	}
-
-	deviceAddr := s.getDeviceAddress(gateway)
-
-	// Send key event
-	cmd := exec.Command("adb", "-s", deviceAddr, "shell", "input", "keyevent", keyCode)
-	err = cmd.Run()
-	if err != nil {
-		return fmt.Errorf("failed to send key event: %w", err)
-	}
-
-	return nil
-}
-
-// StartApp starts app on device
-func (s *ADBService) StartApp(gatewayID uint, packageName, activityName string) error {
-	gateway, err := s.GetGatewayByID(gatewayID)
-	if err != nil {
-		return err
-	}
-
-	deviceAddr := s.getDeviceAddress(gateway)
-
-	// Start app
-	cmd := exec.Command("adb", "-s", deviceAddr, "shell", "am", "start", "-n", packageName+"/"+activityName)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to start app: %w, output: %s", err, string(output))
-	}
-
-	return nil
-}
-
-// CloseAllConnections closes all ADB connections
-func (s *ADBService) CloseAllConnections() {
-	// Disconnect all devices
-	cmd := exec.Command("adb", "disconnect")
-	cmd.Run()
-}
-
-// MonitorGateways continuously monitors gateway statuses
-func (s *ADBService) MonitorGateways(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if err := s.UpdateAllGatewayStatuses(); err != nil {
-				logrus.Errorf("Failed to update gateway statuses: %v", err)
-			}
-		}
-	}
-}
-
-// getDeviceAddress returns formatted device address
-func (s *ADBService) getDeviceAddress(gateway *models.ADBGateway) string {
-	return fmt.Sprintf("%s:%d", gateway.Host, gateway.Port)
-}
-
-// CheckADBInstalled checks if ADB is installed
-func (s *ADBService) CheckADBInstalled() error {
-	cmd := exec.Command("adb", "version")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ADB not found: %w", err)
-	}
-
-	logrus.Infof("ADB version: %s", string(output))
-	return nil
-}
-
-// StartADBServer starts ADB server
-func (s *ADBService) StartADBServer() error {
-	cmd := exec.Command("adb", "start-server")
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("failed to start ADB server: %w", err)
-	}
-
-	logrus.Info("ADB server started")
-	return nil
-}
-
-// StopADBServer stops ADB server
-func (s *ADBService) StopADBServer() error {
-	cmd := exec.Command("adb", "kill-server")
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("failed to stop ADB server: %w", err)
-	}
-
-	logrus.Info("ADB server stopped")
-	return nil
-}
-
-// ListConnectedDevices lists all connected devices
-func (s *ADBService) ListConnectedDevices() ([]string, error) {
-	cmd := exec.Command("adb", "devices")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list devices: %w", err)
-	}
-
-	var devices []string
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines[1:] { // Skip header line
-		line = strings.TrimSpace(line)
-		if line != "" && strings.Contains(line, "device") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 && parts[1] == "device" {
-				devices = append(devices, parts[0])
-			}
-		}
-	}
-
-	return devices, nil
-}
-
-// PullFile pulls file from device
-func (s *ADBService) PullFile(gatewayID uint, remotePath, localPath string) error {
-	gateway, err := s.GetGatewayByID(gatewayID)
-	if err != nil {
-		return err
-	}
-
-	deviceAddr := s.getDeviceAddress(gateway)
-
-	// Pull file
-	cmd := exec.Command("adb", "-s", deviceAddr, "pull", remotePath, localPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to pull file: %w, output: %s", err, string(output))
-	}
-
-	return nil
-}
-
-// PushFile pushes file to device
-func (s *ADBService) PushFile(gatewayID uint, localPath, remotePath string) error {
-	gateway, err := s.GetGatewayByID(gatewayID)
-	if err != nil {
-		return err
-	}
-
-	deviceAddr := s.getDeviceAddress(gateway)
-
-	// Push file
-	cmd := exec.Command("adb", "-s", deviceAddr, "push", localPath, remotePath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to push file: %w, output: %s", err, string(output))
-	}
 
 	return nil
 }
@@ -534,11 +565,10 @@ func (s *ADBService) TapScreen(gatewayID uint, x, y int) error {
 		return err
 	}
 
-	deviceAddr := s.getDeviceAddress(gateway)
+	containerName := s.getContainerName(gateway)
 
 	// Tap screen
-	cmd := exec.Command("adb", "-s", deviceAddr, "shell", "input", "tap", fmt.Sprintf("%d", x), fmt.Sprintf("%d", y))
-	err = cmd.Run()
+	_, err = s.executeInContainer(containerName, []string{"adb", "shell", "input", "tap", fmt.Sprintf("%d", x), fmt.Sprintf("%d", y)})
 	if err != nil {
 		return fmt.Errorf("failed to tap screen: %w", err)
 	}
@@ -553,17 +583,118 @@ func (s *ADBService) SwipeScreen(gatewayID uint, x1, y1, x2, y2, duration int) e
 		return err
 	}
 
-	deviceAddr := s.getDeviceAddress(gateway)
+	containerName := s.getContainerName(gateway)
 
 	// Swipe screen
-	cmd := exec.Command("adb", "-s", deviceAddr, "shell", "input", "swipe",
+	_, err = s.executeInContainer(containerName, []string{"adb", "shell", "input", "swipe",
 		fmt.Sprintf("%d", x1), fmt.Sprintf("%d", y1),
 		fmt.Sprintf("%d", x2), fmt.Sprintf("%d", y2),
-		fmt.Sprintf("%d", duration))
-	err = cmd.Run()
+		fmt.Sprintf("%d", duration)})
 	if err != nil {
 		return fmt.Errorf("failed to swipe screen: %w", err)
 	}
 
+	return nil
+}
+
+// executeInContainer executes command inside Docker container
+func (s *ADBService) executeInContainer(containerName string, cmd []string) (string, error) {
+	if s.dockerClient == nil {
+		return "", fmt.Errorf("Docker client is not initialized")
+	}
+
+	ctx := context.Background()
+
+	// Create exec configuration
+	execConfig := container.ExecOptions{
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          false,
+	}
+
+	// Create exec
+	execID, err := s.dockerClient.ContainerExecCreate(ctx, containerName, execConfig)
+	if err != nil {
+		return "", fmt.Errorf("failed to create exec: %w", err)
+	}
+
+	// Start exec
+	resp, err := s.dockerClient.ContainerExecAttach(ctx, execID.ID, container.ExecAttachOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to start exec: %w", err)
+	}
+	defer resp.Close()
+
+	// Read output
+	output := new(bytes.Buffer)
+	_, err = io.Copy(output, resp.Reader)
+	if err != nil {
+		return "", fmt.Errorf("failed to read output: %w", err)
+	}
+
+	// Check exec result
+	execInspect, err := s.dockerClient.ContainerExecInspect(ctx, execID.ID)
+	if err != nil {
+		return output.String(), fmt.Errorf("failed to inspect exec: %w", err)
+	}
+
+	if execInspect.ExitCode != 0 {
+		return output.String(), fmt.Errorf("command exited with code %d", execInspect.ExitCode)
+	}
+
+	return output.String(), nil
+}
+
+// getContainerName returns Docker container name for gateway
+func (s *ADBService) getContainerName(gateway *models.ADBGateway) string {
+	// Map gateway to container name based on service code
+	switch gateway.ServiceCode {
+	case "yandex_aon":
+		return "spam_checker_android_yandex"
+	case "kaspersky":
+		return "spam_checker_android_kaspersky"
+	case "getcontact":
+		return "spam_checker_android_getcontact"
+	default:
+		return fmt.Sprintf("android-%s", gateway.Host)
+	}
+}
+
+// CheckDockerConnection checks if Docker is accessible
+func (s *ADBService) CheckDockerConnection() error {
+	if s.dockerClient == nil {
+		return fmt.Errorf("Docker client is not initialized")
+	}
+
+	ctx := context.Background()
+	_, err := s.dockerClient.Ping(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to ping Docker: %w", err)
+	}
+
+	return nil
+}
+
+// ListDockerContainers lists all Docker containers
+func (s *ADBService) ListDockerContainers() ([]types.Container, error) {
+	if s.dockerClient == nil {
+		return nil, fmt.Errorf("Docker client is not initialized")
+	}
+
+	ctx := context.Background()
+	containers, err := s.dockerClient.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	return containers, nil
+}
+
+// Close closes Docker client connection
+func (s *ADBService) Close() error {
+	if s.dockerClient != nil {
+		return s.dockerClient.Close()
+	}
 	return nil
 }

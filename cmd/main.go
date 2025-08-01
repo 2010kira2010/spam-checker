@@ -70,13 +70,13 @@ func main() {
 	userService := services.NewUserService(db)
 	phoneService := services.NewPhoneService(db)
 	checkService := services.NewCheckService(db, cfg)
-	adbService := services.NewADBService(db)
+	adbService := services.NewADBService(db, cfg)
 	settingsService := services.NewSettingsService(db)
 	statisticsService := services.NewStatisticsService(db)
 	notificationService := services.NewNotificationService(db)
 
 	// Initialize scheduler
-	checkScheduler := scheduler.NewCheckScheduler(db, checkService, phoneService, notificationService)
+	checkScheduler := scheduler.NewCheckScheduler(db, checkService, phoneService, notificationService, cfg)
 	checkScheduler.Start()
 
 	// Create Fiber app

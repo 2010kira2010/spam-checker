@@ -14,6 +14,7 @@ type Config struct {
 	JWT      JWTConfig
 	OCR      OCRConfig
 	Swagger  SwaggerConfig
+	Docker   DockerConfig
 }
 
 type AppConfig struct {
@@ -50,6 +51,10 @@ type SwaggerConfig struct {
 	Title       string
 	Description string
 	Version     string
+}
+
+type DockerConfig struct {
+	Host string
 }
 
 func Load() (*Config, error) {
@@ -92,6 +97,9 @@ func Load() (*Config, error) {
 			Title:       getEnv("SWAGGER_TITLE", "SpamChecker API"),
 			Description: getEnv("SWAGGER_DESCRIPTION", "API for checking phone numbers in spam services"),
 			Version:     getEnv("SWAGGER_VERSION", "1.0.0"),
+		},
+		Docker: DockerConfig{
+			Host: getEnv("DOCKER_HOST", "tcp://localhost:2375"),
 		},
 	}
 

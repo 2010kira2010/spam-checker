@@ -62,6 +62,8 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 	adb.Post("/gateways/:id/execute", authMiddleware.RequireRole(models.RoleAdmin), executeCommandHandler(adbService))
 	adb.Post("/gateways/:id/restart", authMiddleware.RequireRole(models.RoleAdmin), restartDeviceHandler(adbService))
 	adb.Post("/gateways/:id/install-apk", authMiddleware.RequireRole(models.RoleAdmin), installAPKHandler(adbService))
+	adb.Get("/docker/status", checkDockerStatusHandler(adbService))
+	adb.Get("/docker/containers", listDockerContainersHandler(adbService))
 }
 
 // listGatewaysHandler godoc
@@ -449,5 +451,67 @@ func installAPKHandler(adbService *services.ADBService) fiber.Handler {
 		return c.JSON(MessageResponse{
 			Message: "APK installed successfully",
 		})
+	}
+}
+
+// checkDockerStatusHandler godoc
+// @Summary Check Docker status
+// @Description Check if Docker daemon is accessible
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Security BearerAuth
+// @Router /adb/docker/status [get]
+func checkDockerStatusHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		err := adbService.CheckDockerConnection()
+		status := "connected"
+		message := "Docker daemon is accessible"
+
+		if err != nil {
+			status = "disconnected"
+			message = err.Error()
+		}
+
+		return c.JSON(fiber.Map{
+			"status":  status,
+			"message": message,
+		})
+	}
+}
+
+// listDockerContainersHandler godoc
+// @Summary List Docker containers
+// @Description List all Docker containers
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Success 200 {object} []map[string]interface{}
+// @Security BearerAuth
+// @Router /adb/docker/containers [get]
+func listDockerContainersHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		containers, err := adbService.ListDockerContainers()
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+		}
+
+		// Transform to simplified format
+		result := make([]map[string]interface{}, len(containers))
+		for i, container := range containers {
+			result[i] = map[string]interface{}{
+				"id":     container.ID[:12],
+				"names":  container.Names,
+				"image":  container.Image,
+				"state":  container.State,
+				"status": container.Status,
+				"ports":  container.Ports,
+			}
+		}
+
+		return c.JSON(result)
 	}
 }

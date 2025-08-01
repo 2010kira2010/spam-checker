@@ -32,7 +32,7 @@ func NewCheckService(db *gorm.DB, cfg *config.Config) *CheckService {
 	return &CheckService{
 		db:         db,
 		cfg:        cfg,
-		adbService: NewADBService(db),
+		adbService: NewADBServiceWithConfig(db, cfg),
 	}
 }
 
@@ -93,48 +93,56 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 
 	logrus.Infof("Checking %s on %s", phone.Number, service.Name)
 
-	// Open app based on service
-	//appPackage, appActivity := s.getAppInfo(gateway.ServiceCode)
-	//if err := s.adbService.StartApp(gateway.ID, appPackage, appActivity); err != nil {
-	//	return fmt.Errorf("failed to open app: %w", err)
-	//}
-
-	//time.Sleep(3 * time.Second)
-
-	// Clear previous search
-	if err := s.adbService.SendKeyEvent(gateway.ID, "KEYCODE_CLEAR"); err != nil {
-		logrus.Warnf("Failed to clear previous search: %v", err)
+	// Since apps are pre-installed, we just need to ensure the app is running
+	appPackage, appActivity := s.getAppInfo(gateway.ServiceCode)
+	if appPackage != "" && appActivity != "" {
+		// Try to start the app (it may already be running)
+		if err := s.adbService.StartApp(gateway.ID, appPackage, appActivity); err != nil {
+			logrus.Warnf("Failed to start app (it may already be running): %v", err)
+		}
+		time.Sleep(2 * time.Second)
 	}
 
-	// Input phone number
-	if err := s.adbService.InputText(gateway.ID, phone.Number); err != nil {
-		return fmt.Errorf("failed to input phone number: %w", err)
+	// Simulate incoming call
+	logrus.Infof("Simulating incoming call from %s", phone.Number)
+	if err := s.adbService.SimulateIncomingCall(gateway.ID, phone.Number); err != nil {
+		return fmt.Errorf("failed to simulate incoming call: %w", err)
 	}
 
-	// Press search
-	if err := s.adbService.SendKeyEvent(gateway.ID, "KEYCODE_ENTER"); err != nil {
-		return fmt.Errorf("failed to press search: %w", err)
-	}
-
-	// Wait for results
+	// Wait for the service to process the call
 	time.Sleep(5 * time.Second)
 
 	// Take screenshot
 	screenshot, err := s.adbService.TakeScreenshot(gateway.ID)
 	if err != nil {
-		return fmt.Errorf("failed to take screenshot: %w", err)
+		logrus.Errorf("Failed to take screenshot: %v", err)
+		// Continue with empty screenshot
+		screenshot = []byte{}
 	}
 
-	// Save screenshot
-	screenshotPath, err := s.saveScreenshot(screenshot, phone.Number, service.Code)
-	if err != nil {
-		return fmt.Errorf("failed to save screenshot: %w", err)
+	// End the call
+	if err := s.adbService.EndCall(gateway.ID); err != nil {
+		logrus.Warnf("Failed to end call: %v", err)
 	}
 
-	// Perform OCR
-	ocrText, err := s.performOCR(screenshotPath)
-	if err != nil {
-		return fmt.Errorf("failed to perform OCR: %w", err)
+	// Save screenshot if we got one
+	var screenshotPath string
+	if len(screenshot) > 0 {
+		screenshotPath, err = s.saveScreenshot(screenshot, phone.Number, service.Code)
+		if err != nil {
+			logrus.Errorf("Failed to save screenshot: %v", err)
+			screenshotPath = ""
+		}
+	}
+
+	// Perform OCR if we have a screenshot
+	var ocrText string
+	if screenshotPath != "" {
+		ocrText, err = s.performOCR(screenshotPath)
+		if err != nil {
+			logrus.Errorf("Failed to perform OCR: %v", err)
+			ocrText = ""
+		}
 	}
 
 	// Check for spam keywords
@@ -158,6 +166,9 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	// Update statistics
 	s.updateStatistics(phone.ID, service.ID, isSpam)
 
+	logrus.Infof("Check completed for %s on %s: isSpam=%v, keywords=%v",
+		phone.Number, service.Name, isSpam, foundKeywords)
+
 	return nil
 }
 
@@ -173,7 +184,7 @@ func (s *CheckService) saveScreenshot(data []byte, phoneNumber, serviceCode stri
 	filename := fmt.Sprintf("%s_%s_%d.png", phoneNumber, serviceCode, time.Now().Unix())
 	path := filepath.Join(dir, filename)
 
-	// Decode and save image
+	// Try to decode and save as PNG
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		// If decoding fails, save raw data
@@ -344,6 +355,18 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 		Number:   phoneNumber,
 		IsActive: false, // Don't save for scheduled checks
 	}
+
+	// Save temporarily to get ID
+	if err := s.db.Create(tempPhone).Error; err != nil {
+		return nil, fmt.Errorf("failed to create temporary phone record: %w", err)
+	}
+
+	// Ensure cleanup
+	defer func() {
+		// Delete temporary phone record and its results
+		s.db.Where("phone_number_id = ?", tempPhone.ID).Delete(&models.CheckResult{})
+		s.db.Delete(tempPhone)
+	}()
 
 	// Get active gateways
 	gateways, err := s.adbService.GetActiveGateways()
