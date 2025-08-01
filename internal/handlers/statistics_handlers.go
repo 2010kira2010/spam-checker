@@ -12,15 +12,27 @@ import (
 func RegisterStatisticsRoutes(api fiber.Router, statisticsService *services.StatisticsService, authMiddleware *middleware.AuthMiddleware) {
 	stats := api.Group("/statistics")
 
-	// @Summary Get overview statistics
-	// @Description Get general overview statistics
-	// @Tags statistics
-	// @Accept json
-	// @Produce json
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /statistics/overview [get]
-	stats.Get("/overview", func(c *fiber.Ctx) error {
+	stats.Get("/overview", getOverviewStatsHandler(statisticsService))
+	stats.Get("/timeseries", getTimeSeriesStatsHandler(statisticsService))
+	stats.Get("/services", getServiceStatsHandler(statisticsService))
+	stats.Get("/keywords", getTopSpamKeywordsHandler(statisticsService))
+	stats.Get("/phone-history", getPhoneSpamHistoryHandler(statisticsService))
+	stats.Get("/trends", getSpamTrendsHandler(statisticsService))
+	stats.Get("/recent-spam", getRecentSpamDetectionsHandler(statisticsService))
+	stats.Get("/export", exportStatisticsHandler(statisticsService))
+}
+
+// getOverviewStatsHandler godoc
+// @Summary Get overview statistics
+// @Description Get general overview statistics
+// @Tags statistics
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Security BearerAuth
+// @Router /statistics/overview [get]
+func getOverviewStatsHandler(statisticsService *services.StatisticsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		stats, err := statisticsService.GetOverviewStats()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -29,18 +41,21 @@ func RegisterStatisticsRoutes(api fiber.Router, statisticsService *services.Stat
 		}
 
 		return c.JSON(stats)
-	})
+	}
+}
 
-	// @Summary Get time series statistics
-	// @Description Get statistics for time series charts
-	// @Tags statistics
-	// @Accept json
-	// @Produce json
-	// @Param days query int false "Number of days" default(7)
-	// @Success 200 {array} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /statistics/timeseries [get]
-	stats.Get("/timeseries", func(c *fiber.Ctx) error {
+// getTimeSeriesStatsHandler godoc
+// @Summary Get time series statistics
+// @Description Get statistics for time series charts
+// @Tags statistics
+// @Accept json
+// @Produce json
+// @Param days query int false "Number of days" default(7)
+// @Success 200 {array} map[string]interface{}
+// @Security BearerAuth
+// @Router /statistics/timeseries [get]
+func getTimeSeriesStatsHandler(statisticsService *services.StatisticsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		days, _ := strconv.Atoi(c.Query("days", "7"))
 		if days < 1 || days > 365 {
 			days = 7
@@ -54,17 +69,20 @@ func RegisterStatisticsRoutes(api fiber.Router, statisticsService *services.Stat
 		}
 
 		return c.JSON(stats)
-	})
+	}
+}
 
-	// @Summary Get service statistics
-	// @Description Get statistics by service
-	// @Tags statistics
-	// @Accept json
-	// @Produce json
-	// @Success 200 {array} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /statistics/services [get]
-	stats.Get("/services", func(c *fiber.Ctx) error {
+// getServiceStatsHandler godoc
+// @Summary Get service statistics
+// @Description Get statistics by service
+// @Tags statistics
+// @Accept json
+// @Produce json
+// @Success 200 {array} map[string]interface{}
+// @Security BearerAuth
+// @Router /statistics/services [get]
+func getServiceStatsHandler(statisticsService *services.StatisticsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		stats, err := statisticsService.GetServiceStats()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -73,18 +91,21 @@ func RegisterStatisticsRoutes(api fiber.Router, statisticsService *services.Stat
 		}
 
 		return c.JSON(stats)
-	})
+	}
+}
 
-	// @Summary Get top spam keywords
-	// @Description Get most common spam keywords
-	// @Tags statistics
-	// @Accept json
-	// @Produce json
-	// @Param limit query int false "Limit results" default(10)
-	// @Success 200 {array} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /statistics/keywords [get]
-	stats.Get("/keywords", func(c *fiber.Ctx) error {
+// getTopSpamKeywordsHandler godoc
+// @Summary Get top spam keywords
+// @Description Get most common spam keywords
+// @Tags statistics
+// @Accept json
+// @Produce json
+// @Param limit query int false "Limit results" default(10)
+// @Success 200 {array} map[string]interface{}
+// @Security BearerAuth
+// @Router /statistics/keywords [get]
+func getTopSpamKeywordsHandler(statisticsService *services.StatisticsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		limit, _ := strconv.Atoi(c.Query("limit", "10"))
 		if limit < 1 || limit > 100 {
 			limit = 10
@@ -98,18 +119,21 @@ func RegisterStatisticsRoutes(api fiber.Router, statisticsService *services.Stat
 		}
 
 		return c.JSON(keywords)
-	})
+	}
+}
 
-	// @Summary Get phone spam history
-	// @Description Get spam detection history for specific phone
-	// @Tags statistics
-	// @Accept json
-	// @Produce json
-	// @Param phone_id query int true "Phone ID"
-	// @Success 200 {array} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /statistics/phone-history [get]
-	stats.Get("/phone-history", func(c *fiber.Ctx) error {
+// getPhoneSpamHistoryHandler godoc
+// @Summary Get phone spam history
+// @Description Get spam detection history for specific phone
+// @Tags statistics
+// @Accept json
+// @Produce json
+// @Param phone_id query int true "Phone ID"
+// @Success 200 {array} map[string]interface{}
+// @Security BearerAuth
+// @Router /statistics/phone-history [get]
+func getPhoneSpamHistoryHandler(statisticsService *services.StatisticsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		phoneID, err := strconv.ParseUint(c.Query("phone_id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -125,18 +149,21 @@ func RegisterStatisticsRoutes(api fiber.Router, statisticsService *services.Stat
 		}
 
 		return c.JSON(history)
-	})
+	}
+}
 
-	// @Summary Get spam trends
-	// @Description Get spam trends over time
-	// @Tags statistics
-	// @Accept json
-	// @Produce json
-	// @Param interval query string false "Interval (hourly, daily, weekly, monthly)" default(daily)
-	// @Success 200 {array} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /statistics/trends [get]
-	stats.Get("/trends", func(c *fiber.Ctx) error {
+// getSpamTrendsHandler godoc
+// @Summary Get spam trends
+// @Description Get spam trends over time
+// @Tags statistics
+// @Accept json
+// @Produce json
+// @Param interval query string false "Interval (hourly, daily, weekly, monthly)" default(daily)
+// @Success 200 {array} map[string]interface{}
+// @Security BearerAuth
+// @Router /statistics/trends [get]
+func getSpamTrendsHandler(statisticsService *services.StatisticsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		interval := c.Query("interval", "daily")
 		validIntervals := map[string]bool{
 			"hourly":  true,
@@ -157,18 +184,21 @@ func RegisterStatisticsRoutes(api fiber.Router, statisticsService *services.Stat
 		}
 
 		return c.JSON(trends)
-	})
+	}
+}
 
-	// @Summary Get recent spam detections
-	// @Description Get recent spam detections
-	// @Tags statistics
-	// @Accept json
-	// @Produce json
-	// @Param limit query int false "Limit results" default(10)
-	// @Success 200 {array} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /statistics/recent-spam [get]
-	stats.Get("/recent-spam", func(c *fiber.Ctx) error {
+// getRecentSpamDetectionsHandler godoc
+// @Summary Get recent spam detections
+// @Description Get recent spam detections
+// @Tags statistics
+// @Accept json
+// @Produce json
+// @Param limit query int false "Limit results" default(10)
+// @Success 200 {array} map[string]interface{}
+// @Security BearerAuth
+// @Router /statistics/recent-spam [get]
+func getRecentSpamDetectionsHandler(statisticsService *services.StatisticsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		limit, _ := strconv.Atoi(c.Query("limit", "10"))
 		if limit < 1 || limit > 100 {
 			limit = 10
@@ -182,21 +212,24 @@ func RegisterStatisticsRoutes(api fiber.Router, statisticsService *services.Stat
 		}
 
 		return c.JSON(detections)
-	})
+	}
+}
 
-	// @Summary Export statistics report
-	// @Description Export statistics report as CSV
-	// @Tags statistics
-	// @Produce text/csv
-	// @Param start_date query string false "Start date (YYYY-MM-DD)"
-	// @Param end_date query string false "End date (YYYY-MM-DD)"
-	// @Success 200 {file} file
-	// @Security BearerAuth
-	// @Router /statistics/export [get]
-	stats.Get("/export", func(c *fiber.Ctx) error {
+// exportStatisticsHandler godoc
+// @Summary Export statistics report
+// @Description Export statistics report as CSV
+// @Tags statistics
+// @Produce text/csv
+// @Param start_date query string false "Start date (YYYY-MM-DD)"
+// @Param end_date query string false "End date (YYYY-MM-DD)"
+// @Success 200 {file} file
+// @Security BearerAuth
+// @Router /statistics/export [get]
+func exportStatisticsHandler(statisticsService *services.StatisticsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		// TODO: Implement CSV export
 		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{
 			"error": "Export feature not implemented yet",
 		})
-	})
+	}
 }

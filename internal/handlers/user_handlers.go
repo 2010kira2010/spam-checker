@@ -9,6 +9,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
+// UpdateUserRequest represents user update request
 type UpdateUserRequest struct {
 	Username string          `json:"username"`
 	Email    string          `json:"email"`
@@ -17,6 +18,7 @@ type UpdateUserRequest struct {
 	IsActive *bool           `json:"is_active"`
 }
 
+// CreateUserRequest represents user creation request
 type CreateUserRequest struct {
 	Username string          `json:"username" validate:"required,min=3,max=50"`
 	Email    string          `json:"email" validate:"required,email"`
@@ -24,28 +26,68 @@ type CreateUserRequest struct {
 	Role     models.UserRole `json:"role" validate:"required,oneof=admin supervisor user"`
 }
 
+// ChangePasswordRequest represents password change request
 type ChangePasswordRequest struct {
 	Password    string `json:"password" validate:"required,min=6"`
 	OldPassword string `json:"old_password" validate:"required"`
 	NewPassword string `json:"new_password" validate:"required,min=6"`
 }
 
+// UpdateProfileRequest represents profile update request
+type UpdateProfileRequest struct {
+	Username string `json:"username"`
+	Email    string `json:"email"`
+}
+
+// ChangeMyPasswordRequest represents current user password change request
+type ChangeMyPasswordRequest struct {
+	OldPassword string `json:"old_password" validate:"required"`
+	NewPassword string `json:"new_password" validate:"required,min=6"`
+}
+
+// UsersListResponse represents users list response
+type UsersListResponse struct {
+	Users []models.User `json:"users"`
+	Total int64         `json:"total"`
+	Page  int           `json:"page"`
+	Limit int           `json:"limit"`
+}
+
+// MessageResponse represents a generic message response
+type MessageResponse struct {
+	Message string `json:"message"`
+}
+
 // RegisterUserRoutes registers user management routes
 func RegisterUserRoutes(api fiber.Router, userService *services.UserService, authMiddleware *middleware.AuthMiddleware) {
 	users := api.Group("/users")
 
-	// @Summary List users
-	// @Description Get list of users with pagination
-	// @Tags users
-	// @Accept json
-	// @Produce json
-	// @Param page query int false "Page number" default(1)
-	// @Param limit query int false "Items per page" default(20)
-	// @Param role query string false "Filter by role"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /users [get]
-	users.Get("/", authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor), func(c *fiber.Ctx) error {
+	users.Get("/", authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor), listUsersHandler(userService))
+	users.Get("/me", getCurrentUserHandler(userService))
+	users.Put("/me", updateCurrentUserHandler(userService))
+	users.Put("/me/password", changeMyPasswordHandler(userService))
+	users.Get("/stats", authMiddleware.RequireRole(models.RoleAdmin), getUserStatsHandler(userService))
+	users.Get("/:id", authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor), getUserByIDHandler(userService))
+	users.Post("/", authMiddleware.RequireRole(models.RoleAdmin), createUserHandler(userService))
+	users.Put("/:id", authMiddleware.RequireRole(models.RoleAdmin), updateUserHandler(userService))
+	users.Delete("/:id", authMiddleware.RequireRole(models.RoleAdmin), deleteUserHandler(userService))
+	users.Put("/:id/password", authMiddleware.RequireRole(models.RoleAdmin), changeUserPasswordHandler(userService))
+}
+
+// listUsersHandler godoc
+// @Summary List users
+// @Description Get list of users with pagination
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param role query string false "Filter by role"
+// @Success 200 {object} UsersListResponse
+// @Security BearerAuth
+// @Router /users [get]
+func listUsersHandler(userService *services.UserService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		page, _ := strconv.Atoi(c.Query("page", "1"))
 		limit, _ := strconv.Atoi(c.Query("limit", "20"))
 		role := c.Query("role")
@@ -58,24 +100,27 @@ func RegisterUserRoutes(api fiber.Router, userService *services.UserService, aut
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"users": users,
-			"total": total,
-			"page":  page,
-			"limit": limit,
+		return c.JSON(UsersListResponse{
+			Users: users,
+			Total: total,
+			Page:  page,
+			Limit: limit,
 		})
-	})
+	}
+}
 
-	// @Summary Get user
-	// @Description Get user by ID
-	// @Tags users
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "User ID"
-	// @Success 200 {object} models.User
-	// @Security BearerAuth
-	// @Router /users/{id} [get]
-	users.Get("/:id", authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor), func(c *fiber.Ctx) error {
+// getUserByIDHandler godoc
+// @Summary Get user
+// @Description Get user by ID
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param id path int true "User ID"
+// @Success 200 {object} models.User
+// @Security BearerAuth
+// @Router /users/{id} [get]
+func getUserByIDHandler(userService *services.UserService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -91,18 +136,21 @@ func RegisterUserRoutes(api fiber.Router, userService *services.UserService, aut
 		}
 
 		return c.JSON(user)
-	})
+	}
+}
 
-	// @Summary Create user
-	// @Description Create a new user (admin only)
-	// @Tags users
-	// @Accept json
-	// @Produce json
-	// @Param request body CreateUserRequest true "User data"
-	// @Success 201 {object} models.User
-	// @Security BearerAuth
-	// @Router /users [post]
-	users.Post("/", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// createUserHandler godoc
+// @Summary Create user
+// @Description Create a new user (admin only)
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param request body CreateUserRequest true "User data"
+// @Success 201 {object} models.User
+// @Security BearerAuth
+// @Router /users [post]
+func createUserHandler(userService *services.UserService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		var req CreateUserRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -125,19 +173,22 @@ func RegisterUserRoutes(api fiber.Router, userService *services.UserService, aut
 		}
 
 		return c.Status(fiber.StatusCreated).JSON(user)
-	})
+	}
+}
 
-	// @Summary Update user
-	// @Description Update user information
-	// @Tags users
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "User ID"
-	// @Param request body UpdateUserRequest true "User update data"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /users/{id} [put]
-	users.Put("/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// updateUserHandler godoc
+// @Summary Update user
+// @Description Update user information
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param id path int true "User ID"
+// @Param request body UpdateUserRequest true "User update data"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /users/{id} [put]
+func updateUserHandler(userService *services.UserService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -186,21 +237,24 @@ func RegisterUserRoutes(api fiber.Router, userService *services.UserService, aut
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "User updated successfully",
+		return c.JSON(MessageResponse{
+			Message: "User updated successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Delete user
-	// @Description Delete user (admin only)
-	// @Tags users
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "User ID"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /users/{id} [delete]
-	users.Delete("/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// deleteUserHandler godoc
+// @Summary Delete user
+// @Description Delete user (admin only)
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param id path int true "User ID"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /users/{id} [delete]
+func deleteUserHandler(userService *services.UserService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -222,22 +276,25 @@ func RegisterUserRoutes(api fiber.Router, userService *services.UserService, aut
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "User deleted successfully",
+		return c.JSON(MessageResponse{
+			Message: "User deleted successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Change user password
-	// @Description Change user password (admin only)
-	// @Tags users
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "User ID"
-	// @Param request body ChangePasswordRequest true "New password"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /users/{id}/password [put]
-	users.Put("/:id/password", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// changeUserPasswordHandler godoc
+// @Summary Change user password
+// @Description Change user password (admin only)
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param id path int true "User ID"
+// @Param request body ChangePasswordRequest true "New password"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /users/{id}/password [put]
+func changeUserPasswordHandler(userService *services.UserService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -260,20 +317,23 @@ func RegisterUserRoutes(api fiber.Router, userService *services.UserService, aut
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Password changed successfully",
+		return c.JSON(MessageResponse{
+			Message: "Password changed successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Get current user
-	// @Description Get current authenticated user
-	// @Tags users
-	// @Accept json
-	// @Produce json
-	// @Success 200 {object} models.User
-	// @Security BearerAuth
-	// @Router /users/me [get]
-	users.Get("/me", func(c *fiber.Ctx) error {
+// getCurrentUserHandler godoc
+// @Summary Get current user
+// @Description Get current authenticated user
+// @Tags users
+// @Accept json
+// @Produce json
+// @Success 200 {object} models.User
+// @Security BearerAuth
+// @Router /users/me [get]
+func getCurrentUserHandler(userService *services.UserService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		userID := middleware.GetUserID(c)
 		user, err := userService.GetUserByID(userID)
 		if err != nil {
@@ -283,25 +343,24 @@ func RegisterUserRoutes(api fiber.Router, userService *services.UserService, aut
 		}
 
 		return c.JSON(user)
-	})
+	}
+}
 
-	// @Summary Update current user
-	// @Description Update current user profile
-	// @Tags users
-	// @Accept json
-	// @Produce json
-	// @Param request body UpdateProfileRequest true "Profile data"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /users/me [put]
-	users.Put("/me", func(c *fiber.Ctx) error {
+// updateCurrentUserHandler godoc
+// @Summary Update current user
+// @Description Update current user profile
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param request body UpdateProfileRequest true "Profile data"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /users/me [put]
+func updateCurrentUserHandler(userService *services.UserService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		userID := middleware.GetUserID(c)
 
-		var req struct {
-			Username string `json:"username"`
-			Email    string `json:"email"`
-		}
-
+		var req UpdateProfileRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": "Invalid request body",
@@ -322,28 +381,27 @@ func RegisterUserRoutes(api fiber.Router, userService *services.UserService, aut
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Profile updated successfully",
+		return c.JSON(MessageResponse{
+			Message: "Profile updated successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Change my password
-	// @Description Change current user password
-	// @Tags users
-	// @Accept json
-	// @Produce json
-	// @Param request body ChangeMyPasswordRequest true "Password data"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /users/me/password [put]
-	users.Put("/me/password", func(c *fiber.Ctx) error {
+// changeMyPasswordHandler godoc
+// @Summary Change my password
+// @Description Change current user password
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param request body ChangeMyPasswordRequest true "Password data"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /users/me/password [put]
+func changeMyPasswordHandler(userService *services.UserService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		userID := middleware.GetUserID(c)
 
-		var req struct {
-			OldPassword string `json:"old_password" validate:"required"`
-			NewPassword string `json:"new_password" validate:"required,min=6"`
-		}
-
+		var req ChangeMyPasswordRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": "Invalid request body",
@@ -356,20 +414,23 @@ func RegisterUserRoutes(api fiber.Router, userService *services.UserService, aut
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Password changed successfully",
+		return c.JSON(MessageResponse{
+			Message: "Password changed successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Get user statistics
-	// @Description Get user statistics (admin only)
-	// @Tags users
-	// @Accept json
-	// @Produce json
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /users/stats [get]
-	users.Get("/stats", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// getUserStatsHandler godoc
+// @Summary Get user statistics
+// @Description Get user statistics (admin only)
+// @Tags users
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Security BearerAuth
+// @Router /users/stats [get]
+func getUserStatsHandler(userService *services.UserService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		stats, err := userService.GetUserStats()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -378,5 +439,5 @@ func RegisterUserRoutes(api fiber.Router, userService *services.UserService, aut
 		}
 
 		return c.JSON(stats)
-	})
+	}
 }

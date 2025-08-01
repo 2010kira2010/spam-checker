@@ -9,15 +9,44 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
+// UpdateSettingRequest represents setting update request
 type UpdateSettingRequest struct {
 	Value interface{} `json:"value" validate:"required"`
 }
 
+// CreateSettingRequest represents setting creation request
 type CreateSettingRequest struct {
 	Key      string `json:"key" validate:"required"`
 	Value    string `json:"value" validate:"required"`
 	Type     string `json:"type" validate:"required,oneof=string int bool float json"`
 	Category string `json:"category" validate:"required"`
+}
+
+// CreateKeywordRequest represents keyword creation request
+type CreateKeywordRequest struct {
+	Keyword   string `json:"keyword" validate:"required"`
+	ServiceID *uint  `json:"service_id"`
+}
+
+// UpdateKeywordRequest represents keyword update request
+type UpdateKeywordRequest struct {
+	Keyword   string `json:"keyword"`
+	ServiceID *uint  `json:"service_id"`
+	IsActive  *bool  `json:"is_active"`
+}
+
+// CreateScheduleRequest represents schedule creation request
+type CreateScheduleRequest struct {
+	Name           string `json:"name" validate:"required"`
+	CronExpression string `json:"cron_expression" validate:"required"`
+	IsActive       bool   `json:"is_active"`
+}
+
+// UpdateScheduleRequest represents schedule update request
+type UpdateScheduleRequest struct {
+	Name           string `json:"name"`
+	CronExpression string `json:"cron_expression"`
+	IsActive       *bool  `json:"is_active"`
 }
 
 // RegisterSettingsRoutes registers settings routes
@@ -27,15 +56,40 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 	// All settings routes require admin or supervisor role
 	settings.Use(authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor))
 
-	// @Summary Get all settings
-	// @Description Get all system settings
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Success 200 {array} models.SystemSettings
-	// @Security BearerAuth
-	// @Router /settings [get]
-	settings.Get("/", func(c *fiber.Ctx) error {
+	settings.Get("/", getAllSettingsHandler(settingsService))
+	settings.Get("/category/:category", getSettingsByCategoryHandler(settingsService))
+	settings.Get("/groups", getSettingsGroupsHandler(settingsService))
+	settings.Get("/database/config", getDatabaseConfigHandler(settingsService))
+	settings.Get("/ocr/config", getOCRConfigHandler(settingsService))
+	settings.Put("/ocr/config", authMiddleware.RequireRole(models.RoleAdmin), updateOCRConfigHandler(settingsService))
+	settings.Get("/intervals", getCheckIntervalsHandler(settingsService))
+	settings.Get("/export", authMiddleware.RequireRole(models.RoleAdmin), exportSettingsHandler(settingsService))
+	settings.Post("/import", authMiddleware.RequireRole(models.RoleAdmin), importSettingsHandler(settingsService))
+	settings.Get("/keywords", getSpamKeywordsHandler(settingsService))
+	settings.Post("/keywords", authMiddleware.RequireRole(models.RoleAdmin), createSpamKeywordHandler(settingsService))
+	settings.Put("/keywords/:id", authMiddleware.RequireRole(models.RoleAdmin), updateSpamKeywordHandler(settingsService))
+	settings.Delete("/keywords/:id", authMiddleware.RequireRole(models.RoleAdmin), deleteSpamKeywordHandler(settingsService))
+	settings.Get("/schedules", getCheckSchedulesHandler(settingsService))
+	settings.Post("/schedules", authMiddleware.RequireRole(models.RoleAdmin), createCheckScheduleHandler(settingsService))
+	settings.Put("/schedules/:id", authMiddleware.RequireRole(models.RoleAdmin), updateCheckScheduleHandler(settingsService))
+	settings.Delete("/schedules/:id", authMiddleware.RequireRole(models.RoleAdmin), deleteCheckScheduleHandler(settingsService))
+	settings.Get("/:key", getSettingHandler(settingsService))
+	settings.Put("/:key", authMiddleware.RequireRole(models.RoleAdmin), updateSettingHandler(settingsService))
+	settings.Post("/", authMiddleware.RequireRole(models.RoleAdmin), createSettingHandler(settingsService))
+	settings.Delete("/:key", authMiddleware.RequireRole(models.RoleAdmin), deleteSettingHandler(settingsService))
+}
+
+// getAllSettingsHandler godoc
+// @Summary Get all settings
+// @Description Get all system settings
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Success 200 {array} models.SystemSettings
+// @Security BearerAuth
+// @Router /settings [get]
+func getAllSettingsHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		settings, err := settingsService.GetAllSettings()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -44,18 +98,21 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.JSON(settings)
-	})
+	}
+}
 
-	// @Summary Get settings by category
-	// @Description Get all settings in a category
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param category path string true "Category name"
-	// @Success 200 {array} models.SystemSettings
-	// @Security BearerAuth
-	// @Router /settings/category/{category} [get]
-	settings.Get("/category/:category", func(c *fiber.Ctx) error {
+// getSettingsByCategoryHandler godoc
+// @Summary Get settings by category
+// @Description Get all settings in a category
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param category path string true "Category name"
+// @Success 200 {array} models.SystemSettings
+// @Security BearerAuth
+// @Router /settings/category/{category} [get]
+func getSettingsByCategoryHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		category := c.Params("category")
 		settings, err := settingsService.GetSettingsByCategory(category)
 		if err != nil {
@@ -65,17 +122,20 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.JSON(settings)
-	})
+	}
+}
 
-	// @Summary Get settings groups
-	// @Description Get settings grouped by category
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Success 200 {object} map[string][]models.SystemSettings
-	// @Security BearerAuth
-	// @Router /settings/groups [get]
-	settings.Get("/groups", func(c *fiber.Ctx) error {
+// getSettingsGroupsHandler godoc
+// @Summary Get settings groups
+// @Description Get settings grouped by category
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string][]models.SystemSettings
+// @Security BearerAuth
+// @Router /settings/groups [get]
+func getSettingsGroupsHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		groups, err := settingsService.GetSettingsGroups()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -84,18 +144,21 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.JSON(groups)
-	})
+	}
+}
 
-	// @Summary Get setting
-	// @Description Get a single setting by key
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param key path string true "Setting key"
-	// @Success 200 {object} models.SystemSettings
-	// @Security BearerAuth
-	// @Router /settings/{key} [get]
-	settings.Get("/:key", func(c *fiber.Ctx) error {
+// getSettingHandler godoc
+// @Summary Get setting
+// @Description Get a single setting by key
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param key path string true "Setting key"
+// @Success 200 {object} models.SystemSettings
+// @Security BearerAuth
+// @Router /settings/{key} [get]
+func getSettingHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		key := c.Params("key")
 		setting, err := settingsService.GetSetting(key)
 		if err != nil {
@@ -105,19 +168,22 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.JSON(setting)
-	})
+	}
+}
 
-	// @Summary Update setting
-	// @Description Update a setting value
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param key path string true "Setting key"
-	// @Param request body UpdateSettingRequest true "New value"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/{key} [put]
-	settings.Put("/:key", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// updateSettingHandler godoc
+// @Summary Update setting
+// @Description Update a setting value
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param key path string true "Setting key"
+// @Param request body UpdateSettingRequest true "New value"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /settings/{key} [put]
+func updateSettingHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		key := c.Params("key")
 
 		var req UpdateSettingRequest
@@ -133,21 +199,24 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Setting updated successfully",
+		return c.JSON(MessageResponse{
+			Message: "Setting updated successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Create setting
-	// @Description Create a new setting (admin only)
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param request body CreateSettingRequest true "Setting data"
-	// @Success 201 {object} models.SystemSettings
-	// @Security BearerAuth
-	// @Router /settings [post]
-	settings.Post("/", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// createSettingHandler godoc
+// @Summary Create setting
+// @Description Create a new setting (admin only)
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param request body CreateSettingRequest true "Setting data"
+// @Success 201 {object} models.SystemSettings
+// @Security BearerAuth
+// @Router /settings [post]
+func createSettingHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		var req CreateSettingRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -169,18 +238,21 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.Status(fiber.StatusCreated).JSON(setting)
-	})
+	}
+}
 
-	// @Summary Delete setting
-	// @Description Delete a setting (admin only)
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param key path string true "Setting key"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/{key} [delete]
-	settings.Delete("/:key", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// deleteSettingHandler godoc
+// @Summary Delete setting
+// @Description Delete a setting (admin only)
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param key path string true "Setting key"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /settings/{key} [delete]
+func deleteSettingHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		key := c.Params("key")
 
 		if err := settingsService.DeleteSetting(key); err != nil {
@@ -189,20 +261,23 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Setting deleted successfully",
+		return c.JSON(MessageResponse{
+			Message: "Setting deleted successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Get database config
-	// @Description Get database configuration and stats
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/database/config [get]
-	settings.Get("/database/config", func(c *fiber.Ctx) error {
+// getDatabaseConfigHandler godoc
+// @Summary Get database config
+// @Description Get database configuration and stats
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Security BearerAuth
+// @Router /settings/database/config [get]
+func getDatabaseConfigHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		config, err := settingsService.GetDatabaseConfig()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -211,17 +286,20 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.JSON(config)
-	})
+	}
+}
 
-	// @Summary Get OCR config
-	// @Description Get OCR configuration
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/ocr/config [get]
-	settings.Get("/ocr/config", func(c *fiber.Ctx) error {
+// getOCRConfigHandler godoc
+// @Summary Get OCR config
+// @Description Get OCR configuration
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Security BearerAuth
+// @Router /settings/ocr/config [get]
+func getOCRConfigHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		config, err := settingsService.GetOCRConfig()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -230,18 +308,21 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.JSON(config)
-	})
+	}
+}
 
-	// @Summary Update OCR config
-	// @Description Update OCR configuration
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param request body map[string]interface{} true "OCR configuration"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/ocr/config [put]
-	settings.Put("/ocr/config", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// updateOCRConfigHandler godoc
+// @Summary Update OCR config
+// @Description Update OCR configuration
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param request body map[string]interface{} true "OCR configuration"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /settings/ocr/config [put]
+func updateOCRConfigHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		var config map[string]interface{}
 		if err := c.BodyParser(&config); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -255,20 +336,23 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "OCR configuration updated successfully",
+		return c.JSON(MessageResponse{
+			Message: "OCR configuration updated successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Get check intervals
-	// @Description Get check interval settings
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/intervals [get]
-	settings.Get("/intervals", func(c *fiber.Ctx) error {
+// getCheckIntervalsHandler godoc
+// @Summary Get check intervals
+// @Description Get check interval settings
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Security BearerAuth
+// @Router /settings/intervals [get]
+func getCheckIntervalsHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		intervals, err := settingsService.GetCheckIntervals()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -277,17 +361,20 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.JSON(intervals)
-	})
+	}
+}
 
-	// @Summary Export settings
-	// @Description Export all settings as JSON
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Success 200 {object} []models.SystemSettings
-	// @Security BearerAuth
-	// @Router /settings/export [get]
-	settings.Get("/export", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// exportSettingsHandler godoc
+// @Summary Export settings
+// @Description Export all settings as JSON
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Success 200 {object} []models.SystemSettings
+// @Security BearerAuth
+// @Router /settings/export [get]
+func exportSettingsHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		data, err := settingsService.ExportSettings()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -299,17 +386,20 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		c.Set("Content-Disposition", "attachment; filename=settings.json")
 
 		return c.Send(data)
-	})
+	}
+}
 
-	// @Summary Get spam keywords
-	// @Description Get all spam keywords
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Success 200 {array} models.SpamKeyword
-	// @Security BearerAuth
-	// @Router /settings/keywords [get]
-	settings.Get("/keywords", func(c *fiber.Ctx) error {
+// getSpamKeywordsHandler godoc
+// @Summary Get spam keywords
+// @Description Get all spam keywords
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Success 200 {array} models.SpamKeyword
+// @Security BearerAuth
+// @Router /settings/keywords [get]
+func getSpamKeywordsHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		keywords, err := settingsService.GetSpamKeywords()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -318,23 +408,22 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.JSON(keywords)
-	})
+	}
+}
 
-	// @Summary Create spam keyword
-	// @Description Create a new spam keyword
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param request body CreateKeywordRequest true "Keyword data"
-	// @Success 201 {object} models.SpamKeyword
-	// @Security BearerAuth
-	// @Router /settings/keywords [post]
-	settings.Post("/keywords", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
-		var req struct {
-			Keyword   string `json:"keyword" validate:"required"`
-			ServiceID *uint  `json:"service_id"`
-		}
-
+// createSpamKeywordHandler godoc
+// @Summary Create spam keyword
+// @Description Create a new spam keyword
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param request body CreateKeywordRequest true "Keyword data"
+// @Success 201 {object} models.SpamKeyword
+// @Security BearerAuth
+// @Router /settings/keywords [post]
+func createSpamKeywordHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		var req CreateKeywordRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": "Invalid request body",
@@ -354,19 +443,22 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.Status(fiber.StatusCreated).JSON(keyword)
-	})
+	}
+}
 
-	// @Summary Update spam keyword
-	// @Description Update spam keyword
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Keyword ID"
-	// @Param request body UpdateKeywordRequest true "Keyword update data"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/keywords/{id} [put]
-	settings.Put("/keywords/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// updateSpamKeywordHandler godoc
+// @Summary Update spam keyword
+// @Description Update spam keyword
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param id path int true "Keyword ID"
+// @Param request body UpdateKeywordRequest true "Keyword update data"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /settings/keywords/{id} [put]
+func updateSpamKeywordHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -374,12 +466,7 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 			})
 		}
 
-		var req struct {
-			Keyword   string `json:"keyword"`
-			ServiceID *uint  `json:"service_id"`
-			IsActive  *bool  `json:"is_active"`
-		}
-
+		var req UpdateKeywordRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": "Invalid request body",
@@ -403,21 +490,24 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Keyword updated successfully",
+		return c.JSON(MessageResponse{
+			Message: "Keyword updated successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Delete spam keyword
-	// @Description Delete spam keyword
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Keyword ID"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/keywords/{id} [delete]
-	settings.Delete("/keywords/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// deleteSpamKeywordHandler godoc
+// @Summary Delete spam keyword
+// @Description Delete spam keyword
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param id path int true "Keyword ID"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /settings/keywords/{id} [delete]
+func deleteSpamKeywordHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -431,20 +521,23 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Keyword deleted successfully",
+		return c.JSON(MessageResponse{
+			Message: "Keyword deleted successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Get check schedules
-	// @Description Get all check schedules
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Success 200 {array} models.CheckSchedule
-	// @Security BearerAuth
-	// @Router /settings/schedules [get]
-	settings.Get("/schedules", func(c *fiber.Ctx) error {
+// getCheckSchedulesHandler godoc
+// @Summary Get check schedules
+// @Description Get all check schedules
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Success 200 {array} models.CheckSchedule
+// @Security BearerAuth
+// @Router /settings/schedules [get]
+func getCheckSchedulesHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		schedules, err := settingsService.GetCheckSchedules()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -453,24 +546,22 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.JSON(schedules)
-	})
+	}
+}
 
-	// @Summary Create check schedule
-	// @Description Create a new check schedule
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param request body CreateScheduleRequest true "Schedule data"
-	// @Success 201 {object} models.CheckSchedule
-	// @Security BearerAuth
-	// @Router /settings/schedules [post]
-	settings.Post("/schedules", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
-		var req struct {
-			Name           string `json:"name" validate:"required"`
-			CronExpression string `json:"cron_expression" validate:"required"`
-			IsActive       bool   `json:"is_active"`
-		}
-
+// createCheckScheduleHandler godoc
+// @Summary Create check schedule
+// @Description Create a new check schedule
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param request body CreateScheduleRequest true "Schedule data"
+// @Success 201 {object} models.CheckSchedule
+// @Security BearerAuth
+// @Router /settings/schedules [post]
+func createCheckScheduleHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		var req CreateScheduleRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": "Invalid request body",
@@ -490,19 +581,22 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 		}
 
 		return c.Status(fiber.StatusCreated).JSON(schedule)
-	})
+	}
+}
 
-	// @Summary Update check schedule
-	// @Description Update check schedule
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Schedule ID"
-	// @Param request body UpdateScheduleRequest true "Schedule update data"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/schedules/{id} [put]
-	settings.Put("/schedules/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// updateCheckScheduleHandler godoc
+// @Summary Update check schedule
+// @Description Update check schedule
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param id path int true "Schedule ID"
+// @Param request body UpdateScheduleRequest true "Schedule update data"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /settings/schedules/{id} [put]
+func updateCheckScheduleHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -510,12 +604,7 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 			})
 		}
 
-		var req struct {
-			Name           string `json:"name"`
-			CronExpression string `json:"cron_expression"`
-			IsActive       *bool  `json:"is_active"`
-		}
-
+		var req UpdateScheduleRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": "Invalid request body",
@@ -539,21 +628,24 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Schedule updated successfully",
+		return c.JSON(MessageResponse{
+			Message: "Schedule updated successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Delete check schedule
-	// @Description Delete check schedule
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Schedule ID"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/schedules/{id} [delete]
-	settings.Delete("/schedules/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// deleteCheckScheduleHandler godoc
+// @Summary Delete check schedule
+// @Description Delete check schedule
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param id path int true "Schedule ID"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /settings/schedules/{id} [delete]
+func deleteCheckScheduleHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -566,21 +658,24 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 				"error": err.Error(),
 			})
 		}
-		return c.JSON(fiber.Map{
-			"message": "Schedule delete successfully",
+		return c.JSON(MessageResponse{
+			Message: "Schedule deleted successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Import settings
-	// @Description Import settings from JSON
-	// @Tags settings
-	// @Accept json
-	// @Produce json
-	// @Param settings body []models.SystemSettings true "Settings to import"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /settings/import [post]
-	settings.Post("/import", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// importSettingsHandler godoc
+// @Summary Import settings
+// @Description Import settings from JSON
+// @Tags settings
+// @Accept json
+// @Produce json
+// @Param settings body []models.SystemSettings true "Settings to import"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /settings/import [post]
+func importSettingsHandler(settingsService *services.SettingsService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		data := c.Body()
 
 		if err := settingsService.ImportSettings(data); err != nil {
@@ -589,8 +684,8 @@ func RegisterSettingsRoutes(api fiber.Router, settingsService *services.Settings
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Settings imported successfully",
+		return c.JSON(MessageResponse{
+			Message: "Settings imported successfully",
 		})
-	})
+	}
 }

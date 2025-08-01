@@ -94,12 +94,12 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	logrus.Infof("Checking %s on %s", phone.Number, service.Name)
 
 	// Open app based on service
-	appPackage, appActivity := s.getAppInfo(gateway.ServiceCode)
-	if err := s.adbService.StartApp(gateway.ID, appPackage, appActivity); err != nil {
-		return fmt.Errorf("failed to open app: %w", err)
-	}
+	//appPackage, appActivity := s.getAppInfo(gateway.ServiceCode)
+	//if err := s.adbService.StartApp(gateway.ID, appPackage, appActivity); err != nil {
+	//	return fmt.Errorf("failed to open app: %w", err)
+	//}
 
-	time.Sleep(3 * time.Second)
+	//time.Sleep(3 * time.Second)
 
 	// Clear previous search
 	if err := s.adbService.SendKeyEvent(gateway.ID, "KEYCODE_CLEAR"); err != nil {
@@ -159,21 +159,6 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	s.updateStatistics(phone.ID, service.ID, isSpam)
 
 	return nil
-}
-
-// takeScreenshot takes screenshot from Android device
-func (s *CheckService) takeScreenshot(gateway *models.ADBGateway) ([]byte, error) {
-	// Take screenshot
-	screenshotCmd := fmt.Sprintf("adb -s %s:%d shell screencap -p", gateway.Host, gateway.Port)
-	output, err := exec.Command("sh", "-c", screenshotCmd).Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to take screenshot: %w", err)
-	}
-
-	// Convert output (remove carriage returns on Windows)
-	screenshot := bytes.Replace(output, []byte("\r\n"), []byte("\n"), -1)
-
-	return screenshot, nil
 }
 
 // saveScreenshot saves screenshot to file

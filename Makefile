@@ -79,7 +79,7 @@ test:
 # Generate Swagger documentation
 swagger:
 	@echo "Generating Swagger documentation..."
-	swag init -g ./cmd/main.go -o ./docs
+	swag init -g ./cmd/main.go -o ./docs --parseInternal --generatedTime
 
 # Docker commands
 docker-build: swagger

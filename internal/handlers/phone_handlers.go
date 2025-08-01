@@ -9,35 +9,63 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
+// CreatePhoneRequest represents phone creation request
 type CreatePhoneRequest struct {
 	Number      string `json:"number" validate:"required"`
 	Description string `json:"description"`
 	IsActive    bool   `json:"is_active"`
 }
 
+// UpdatePhoneRequest represents phone update request
 type UpdatePhoneRequest struct {
 	Number      string `json:"number"`
 	Description string `json:"description"`
 	IsActive    *bool  `json:"is_active"`
 }
 
+// PhonesListResponse represents phones list response
+type PhonesListResponse struct {
+	Phones []models.PhoneNumber `json:"phones"`
+	Total  int64                `json:"total"`
+	Page   int                  `json:"page"`
+	Limit  int                  `json:"limit"`
+}
+
+// ImportPhonesResponse represents import phones response
+type ImportPhonesResponse struct {
+	Imported int      `json:"imported"`
+	Errors   []string `json:"errors"`
+}
+
 // RegisterPhoneRoutes registers phone number routes
 func RegisterPhoneRoutes(api fiber.Router, phoneService *services.PhoneService, authMiddleware *middleware.AuthMiddleware) {
 	phones := api.Group("/phones")
 
-	// @Summary List phones
-	// @Description Get list of phone numbers with pagination
-	// @Tags phones
-	// @Accept json
-	// @Produce json
-	// @Param page query int false "Page number" default(1)
-	// @Param limit query int false "Items per page" default(20)
-	// @Param search query string false "Search query"
-	// @Param is_active query bool false "Filter by active status"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /phones [get]
-	phones.Get("/", func(c *fiber.Ctx) error {
+	phones.Get("/", listPhonesHandler(phoneService))
+	phones.Get("/stats", getPhoneStatsHandler(phoneService))
+	phones.Get("/export", exportPhonesHandler(phoneService))
+	phones.Get("/:id", getPhoneByIDHandler(phoneService))
+	phones.Post("/", authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor), createPhoneHandler(phoneService))
+	phones.Put("/:id", authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor), updatePhoneHandler(phoneService))
+	phones.Delete("/:id", authMiddleware.RequireRole(models.RoleAdmin), deletePhoneHandler(phoneService))
+	phones.Post("/import", authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor), importPhonesHandler(phoneService))
+}
+
+// listPhonesHandler godoc
+// @Summary List phones
+// @Description Get list of phone numbers with pagination
+// @Tags phones
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param search query string false "Search query"
+// @Param is_active query bool false "Filter by active status"
+// @Success 200 {object} PhonesListResponse
+// @Security BearerAuth
+// @Router /phones [get]
+func listPhonesHandler(phoneService *services.PhoneService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		page, _ := strconv.Atoi(c.Query("page", "1"))
 		limit, _ := strconv.Atoi(c.Query("limit", "20"))
 		search := c.Query("search")
@@ -56,24 +84,27 @@ func RegisterPhoneRoutes(api fiber.Router, phoneService *services.PhoneService, 
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"phones": phones,
-			"total":  total,
-			"page":   page,
-			"limit":  limit,
+		return c.JSON(PhonesListResponse{
+			Phones: phones,
+			Total:  total,
+			Page:   page,
+			Limit:  limit,
 		})
-	})
+	}
+}
 
-	// @Summary Get phone
-	// @Description Get phone number by ID
-	// @Tags phones
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Phone ID"
-	// @Success 200 {object} models.PhoneNumber
-	// @Security BearerAuth
-	// @Router /phones/{id} [get]
-	phones.Get("/:id", func(c *fiber.Ctx) error {
+// getPhoneByIDHandler godoc
+// @Summary Get phone
+// @Description Get phone number by ID
+// @Tags phones
+// @Accept json
+// @Produce json
+// @Param id path int true "Phone ID"
+// @Success 200 {object} models.PhoneNumber
+// @Security BearerAuth
+// @Router /phones/{id} [get]
+func getPhoneByIDHandler(phoneService *services.PhoneService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -89,18 +120,21 @@ func RegisterPhoneRoutes(api fiber.Router, phoneService *services.PhoneService, 
 		}
 
 		return c.JSON(phone)
-	})
+	}
+}
 
-	// @Summary Create phone
-	// @Description Create a new phone number
-	// @Tags phones
-	// @Accept json
-	// @Produce json
-	// @Param request body CreatePhoneRequest true "Phone data"
-	// @Success 201 {object} models.PhoneNumber
-	// @Security BearerAuth
-	// @Router /phones [post]
-	phones.Post("/", authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor), func(c *fiber.Ctx) error {
+// createPhoneHandler godoc
+// @Summary Create phone
+// @Description Create a new phone number
+// @Tags phones
+// @Accept json
+// @Produce json
+// @Param request body CreatePhoneRequest true "Phone data"
+// @Success 201 {object} models.PhoneNumber
+// @Security BearerAuth
+// @Router /phones [post]
+func createPhoneHandler(phoneService *services.PhoneService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		var req CreatePhoneRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -123,19 +157,22 @@ func RegisterPhoneRoutes(api fiber.Router, phoneService *services.PhoneService, 
 		}
 
 		return c.Status(fiber.StatusCreated).JSON(phone)
-	})
+	}
+}
 
-	// @Summary Update phone
-	// @Description Update phone number
-	// @Tags phones
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Phone ID"
-	// @Param request body UpdatePhoneRequest true "Phone update data"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /phones/{id} [put]
-	phones.Put("/:id", authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor), func(c *fiber.Ctx) error {
+// updatePhoneHandler godoc
+// @Summary Update phone
+// @Description Update phone number
+// @Tags phones
+// @Accept json
+// @Produce json
+// @Param id path int true "Phone ID"
+// @Param request body UpdatePhoneRequest true "Phone update data"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /phones/{id} [put]
+func updatePhoneHandler(phoneService *services.PhoneService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -167,21 +204,24 @@ func RegisterPhoneRoutes(api fiber.Router, phoneService *services.PhoneService, 
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Phone updated successfully",
+		return c.JSON(MessageResponse{
+			Message: "Phone updated successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Delete phone
-	// @Description Delete phone number
-	// @Tags phones
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Phone ID"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /phones/{id} [delete]
-	phones.Delete("/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// deletePhoneHandler godoc
+// @Summary Delete phone
+// @Description Delete phone number
+// @Tags phones
+// @Accept json
+// @Produce json
+// @Param id path int true "Phone ID"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /phones/{id} [delete]
+func deletePhoneHandler(phoneService *services.PhoneService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -195,21 +235,24 @@ func RegisterPhoneRoutes(api fiber.Router, phoneService *services.PhoneService, 
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Phone deleted successfully",
+		return c.JSON(MessageResponse{
+			Message: "Phone deleted successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Import phones
-	// @Description Import phone numbers from CSV file
-	// @Tags phones
-	// @Accept multipart/form-data
-	// @Produce json
-	// @Param file formData file true "CSV file"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /phones/import [post]
-	phones.Post("/import", authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor), func(c *fiber.Ctx) error {
+// importPhonesHandler godoc
+// @Summary Import phones
+// @Description Import phone numbers from CSV file
+// @Tags phones
+// @Accept multipart/form-data
+// @Produce json
+// @Param file formData file true "CSV file"
+// @Success 200 {object} ImportPhonesResponse
+// @Security BearerAuth
+// @Router /phones/import [post]
+func importPhonesHandler(phoneService *services.PhoneService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		file, err := c.FormFile("file")
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -234,21 +277,24 @@ func RegisterPhoneRoutes(api fiber.Router, phoneService *services.PhoneService, 
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"imported": imported,
-			"errors":   errors,
+		return c.JSON(ImportPhonesResponse{
+			Imported: imported,
+			Errors:   errors,
 		})
-	})
+	}
+}
 
-	// @Summary Export phones
-	// @Description Export phone numbers to CSV file
-	// @Tags phones
-	// @Produce text/csv
-	// @Param is_active query bool false "Filter by active status"
-	// @Success 200 {file} file
-	// @Security BearerAuth
-	// @Router /phones/export [get]
-	phones.Get("/export", func(c *fiber.Ctx) error {
+// exportPhonesHandler godoc
+// @Summary Export phones
+// @Description Export phone numbers to CSV file
+// @Tags phones
+// @Produce text/csv
+// @Param is_active query bool false "Filter by active status"
+// @Success 200 {file} file
+// @Security BearerAuth
+// @Router /phones/export [get]
+func exportPhonesHandler(phoneService *services.PhoneService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		var isActive *bool
 		if activeStr := c.Query("is_active"); activeStr != "" {
 			active := activeStr == "true"
@@ -266,17 +312,20 @@ func RegisterPhoneRoutes(api fiber.Router, phoneService *services.PhoneService, 
 		}
 
 		return nil
-	})
+	}
+}
 
-	// @Summary Get phone stats
-	// @Description Get phone statistics
-	// @Tags phones
-	// @Accept json
-	// @Produce json
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /phones/stats [get]
-	phones.Get("/stats", func(c *fiber.Ctx) error {
+// getPhoneStatsHandler godoc
+// @Summary Get phone stats
+// @Description Get phone statistics
+// @Tags phones
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Security BearerAuth
+// @Router /phones/stats [get]
+func getPhoneStatsHandler(phoneService *services.PhoneService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		stats, err := phoneService.GetPhoneStats()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -285,7 +334,7 @@ func RegisterPhoneRoutes(api fiber.Router, phoneService *services.PhoneService, 
 		}
 
 		return c.JSON(stats)
-	})
+	}
 }
 
 // responseWriter implements io.Writer for Fiber context

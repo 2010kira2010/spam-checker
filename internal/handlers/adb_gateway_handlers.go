@@ -11,6 +11,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
+// CreateADBGatewayRequest represents ADB gateway creation request
 type CreateADBGatewayRequest struct {
 	Name        string `json:"name" validate:"required"`
 	Host        string `json:"host" validate:"required"`
@@ -18,12 +19,29 @@ type CreateADBGatewayRequest struct {
 	ServiceCode string `json:"service_code" validate:"required,oneof=yandex_aon kaspersky getcontact"`
 }
 
+// UpdateADBGatewayRequest represents ADB gateway update request
 type UpdateADBGatewayRequest struct {
 	Name        string `json:"name"`
 	Host        string `json:"host"`
 	Port        int    `json:"port"`
 	ServiceCode string `json:"service_code"`
 	IsActive    *bool  `json:"is_active"`
+}
+
+// ExecuteCommandRequest represents ADB command execution request
+type ExecuteCommandRequest struct {
+	Command string `json:"command" validate:"required"`
+}
+
+// GatewayStatusResponse represents gateway status response
+type GatewayStatusResponse struct {
+	Message string `json:"message"`
+	Status  string `json:"status,omitempty"`
+}
+
+// CommandOutputResponse represents command output response
+type CommandOutputResponse struct {
+	Output string `json:"output"`
 }
 
 // RegisterADBRoutes registers ADB gateway routes
@@ -33,15 +51,30 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 	// All ADB routes require admin or supervisor role
 	adb.Use(authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor))
 
-	// @Summary List ADB gateways
-	// @Description Get all ADB gateways
-	// @Tags adb
-	// @Accept json
-	// @Produce json
-	// @Success 200 {array} models.ADBGateway
-	// @Security BearerAuth
-	// @Router /adb/gateways [get]
-	adb.Get("/gateways", func(c *fiber.Ctx) error {
+	adb.Get("/gateways", listGatewaysHandler(adbService))
+	adb.Get("/gateways/:id", getGatewayHandler(adbService))
+	adb.Post("/gateways", authMiddleware.RequireRole(models.RoleAdmin), createGatewayHandler(adbService))
+	adb.Put("/gateways/:id", authMiddleware.RequireRole(models.RoleAdmin), updateGatewayHandler(adbService))
+	adb.Delete("/gateways/:id", authMiddleware.RequireRole(models.RoleAdmin), deleteGatewayHandler(adbService))
+	adb.Post("/gateways/:id/status", updateGatewayStatusHandler(adbService))
+	adb.Post("/gateways/status", updateAllGatewayStatusesHandler(adbService))
+	adb.Get("/gateways/:id/device-info", getDeviceInfoHandler(adbService))
+	adb.Post("/gateways/:id/execute", authMiddleware.RequireRole(models.RoleAdmin), executeCommandHandler(adbService))
+	adb.Post("/gateways/:id/restart", authMiddleware.RequireRole(models.RoleAdmin), restartDeviceHandler(adbService))
+	adb.Post("/gateways/:id/install-apk", authMiddleware.RequireRole(models.RoleAdmin), installAPKHandler(adbService))
+}
+
+// listGatewaysHandler godoc
+// @Summary List ADB gateways
+// @Description Get all ADB gateways
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Success 200 {object} []models.ADBGateway
+// @Security BearerAuth
+// @Router /adb/gateways [get]
+func listGatewaysHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		gateways, err := adbService.ListGateways()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -50,18 +83,21 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 		}
 
 		return c.JSON(gateways)
-	})
+	}
+}
 
-	// @Summary Get ADB gateway
-	// @Description Get ADB gateway by ID
-	// @Tags adb
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Gateway ID"
-	// @Success 200 {object} models.ADBGateway
-	// @Security BearerAuth
-	// @Router /adb/gateways/{id} [get]
-	adb.Get("/gateways/:id", func(c *fiber.Ctx) error {
+// getGatewayHandler godoc
+// @Summary Get ADB gateway
+// @Description Get ADB gateway by ID
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Param id path int true "Gateway ID"
+// @Success 200 {object} models.ADBGateway
+// @Security BearerAuth
+// @Router /adb/gateways/{id} [get]
+func getGatewayHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -77,18 +113,21 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 		}
 
 		return c.JSON(gateway)
-	})
+	}
+}
 
-	// @Summary Create ADB gateway
-	// @Description Create a new ADB gateway
-	// @Tags adb
-	// @Accept json
-	// @Produce json
-	// @Param request body CreateADBGatewayRequest true "Gateway data"
-	// @Success 201 {object} models.ADBGateway
-	// @Security BearerAuth
-	// @Router /adb/gateways [post]
-	adb.Post("/gateways", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// createGatewayHandler godoc
+// @Summary Create ADB gateway
+// @Description Create a new ADB gateway
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Param request body CreateADBGatewayRequest true "Gateway data"
+// @Success 201 {object} models.ADBGateway
+// @Security BearerAuth
+// @Router /adb/gateways [post]
+func createGatewayHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		var req CreateADBGatewayRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -112,19 +151,22 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 		}
 
 		return c.Status(fiber.StatusCreated).JSON(gateway)
-	})
+	}
+}
 
-	// @Summary Update ADB gateway
-	// @Description Update ADB gateway
-	// @Tags adb
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Gateway ID"
-	// @Param request body UpdateADBGatewayRequest true "Gateway update data"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /adb/gateways/{id} [put]
-	adb.Put("/gateways/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// updateGatewayHandler godoc
+// @Summary Update ADB gateway
+// @Description Update ADB gateway
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Param id path int true "Gateway ID"
+// @Param request body UpdateADBGatewayRequest true "Gateway update data"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /adb/gateways/{id} [put]
+func updateGatewayHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -162,21 +204,24 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Gateway updated successfully",
+		return c.JSON(MessageResponse{
+			Message: "Gateway updated successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Delete ADB gateway
-	// @Description Delete ADB gateway
-	// @Tags adb
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Gateway ID"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /adb/gateways/{id} [delete]
-	adb.Delete("/gateways/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// deleteGatewayHandler godoc
+// @Summary Delete ADB gateway
+// @Description Delete ADB gateway
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Param id path int true "Gateway ID"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /adb/gateways/{id} [delete]
+func deleteGatewayHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -190,21 +235,24 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Gateway deleted successfully",
+		return c.JSON(MessageResponse{
+			Message: "Gateway deleted successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Update gateway status
-	// @Description Update ADB gateway status
-	// @Tags adb
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Gateway ID"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /adb/gateways/{id}/status [post]
-	adb.Post("/gateways/:id/status", func(c *fiber.Ctx) error {
+// updateGatewayStatusHandler godoc
+// @Summary Update gateway status
+// @Description Update ADB gateway status
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Param id path int true "Gateway ID"
+// @Success 200 {object} GatewayStatusResponse
+// @Security BearerAuth
+// @Router /adb/gateways/{id}/status [post]
+func updateGatewayStatusHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -221,42 +269,48 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 		// Get updated gateway
 		gateway, _ := adbService.GetGatewayByID(uint(id))
 
-		return c.JSON(fiber.Map{
-			"message": "Gateway status updated",
-			"status":  gateway.Status,
+		return c.JSON(GatewayStatusResponse{
+			Message: "Gateway status updated",
+			Status:  gateway.Status,
 		})
-	})
+	}
+}
 
-	// @Summary Update all gateway statuses
-	// @Description Update status for all ADB gateways
-	// @Tags adb
-	// @Accept json
-	// @Produce json
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /adb/gateways/status [post]
-	adb.Post("/gateways/status", func(c *fiber.Ctx) error {
+// updateAllGatewayStatusesHandler godoc
+// @Summary Update all gateway statuses
+// @Description Update status for all ADB gateways
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /adb/gateways/status [post]
+func updateAllGatewayStatusesHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		if err := adbService.UpdateAllGatewayStatuses(); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Failed to update gateway statuses",
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "All gateway statuses updated",
+		return c.JSON(MessageResponse{
+			Message: "All gateway statuses updated",
 		})
-	})
+	}
+}
 
-	// @Summary Get device info
-	// @Description Get Android device information
-	// @Tags adb
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Gateway ID"
-	// @Success 200 {object} map[string]string
-	// @Security BearerAuth
-	// @Router /adb/gateways/{id}/device-info [get]
-	adb.Get("/gateways/:id/device-info", func(c *fiber.Ctx) error {
+// getDeviceInfoHandler godoc
+// @Summary Get device info
+// @Description Get Android device information
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Param id path int true "Gateway ID"
+// @Success 200 {object} map[string]string
+// @Security BearerAuth
+// @Router /adb/gateways/{id}/device-info [get]
+func getDeviceInfoHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -272,19 +326,22 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 		}
 
 		return c.JSON(info)
-	})
+	}
+}
 
-	// @Summary Execute ADB command
-	// @Description Execute custom ADB command on gateway
-	// @Tags adb
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Gateway ID"
-	// @Param command body string true "ADB command"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /adb/gateways/{id}/execute [post]
-	adb.Post("/gateways/:id/execute", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// executeCommandHandler godoc
+// @Summary Execute ADB command
+// @Description Execute custom ADB command on gateway
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Param id path int true "Gateway ID"
+// @Param command body ExecuteCommandRequest true "ADB command"
+// @Success 200 {object} CommandOutputResponse
+// @Security BearerAuth
+// @Router /adb/gateways/{id}/execute [post]
+func executeCommandHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -292,10 +349,7 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 			})
 		}
 
-		var req struct {
-			Command string `json:"command" validate:"required"`
-		}
-
+		var req ExecuteCommandRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": "Invalid request body",
@@ -309,21 +363,24 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"output": output,
+		return c.JSON(CommandOutputResponse{
+			Output: output,
 		})
-	})
+	}
+}
 
-	// @Summary Restart device
-	// @Description Restart Android device
-	// @Tags adb
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Gateway ID"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /adb/gateways/{id}/restart [post]
-	adb.Post("/gateways/:id/restart", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// restartDeviceHandler godoc
+// @Summary Restart device
+// @Description Restart Android device
+// @Tags adb
+// @Accept json
+// @Produce json
+// @Param id path int true "Gateway ID"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /adb/gateways/{id}/restart [post]
+func restartDeviceHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -337,22 +394,25 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Device restart initiated",
+		return c.JSON(MessageResponse{
+			Message: "Device restart initiated",
 		})
-	})
+	}
+}
 
-	// @Summary Install APK
-	// @Description Install APK on Android device
-	// @Tags adb
-	// @Accept multipart/form-data
-	// @Produce json
-	// @Param id path int true "Gateway ID"
-	// @Param apk formData file true "APK file"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /adb/gateways/{id}/install-apk [post]
-	adb.Post("/gateways/:id/install-apk", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// installAPKHandler godoc
+// @Summary Install APK
+// @Description Install APK on Android device
+// @Tags adb
+// @Accept multipart/form-data
+// @Produce json
+// @Param id path int true "Gateway ID"
+// @Param apk formData file true "APK file"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /adb/gateways/{id}/install-apk [post]
+func installAPKHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -386,8 +446,8 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 		// Clean up temp file
 		os.Remove(tempPath)
 
-		return c.JSON(fiber.Map{
-			"message": "APK installed successfully",
+		return c.JSON(MessageResponse{
+			Message: "APK installed successfully",
 		})
-	})
+	}
 }

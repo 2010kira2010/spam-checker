@@ -9,16 +9,19 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
+// CreateNotificationRequest represents notification creation request
 type CreateNotificationRequest struct {
 	Type   string `json:"type" validate:"required,oneof=telegram email"`
 	Config string `json:"config" validate:"required"`
 }
 
+// UpdateNotificationRequest represents notification update request
 type UpdateNotificationRequest struct {
 	Config   string `json:"config"`
 	IsActive *bool  `json:"is_active"`
 }
 
+// TestNotificationRequest represents test notification request
 type TestNotificationRequest struct {
 	Message string `json:"message"`
 }
@@ -30,15 +33,26 @@ func RegisterNotificationRoutes(api fiber.Router, notificationService *services.
 	// All notification routes require admin or supervisor role
 	notifications.Use(authMiddleware.RequireRole(models.RoleAdmin, models.RoleSupervisor))
 
-	// @Summary List notifications
-	// @Description Get all notification channels
-	// @Tags notifications
-	// @Accept json
-	// @Produce json
-	// @Success 200 {array} models.Notification
-	// @Security BearerAuth
-	// @Router /notifications [get]
-	notifications.Get("/", func(c *fiber.Ctx) error {
+	notifications.Get("/", listNotificationsHandler(notificationService))
+	notifications.Get("/:id", getNotificationHandler(notificationService))
+	notifications.Post("/", authMiddleware.RequireRole(models.RoleAdmin), createNotificationHandler(notificationService))
+	notifications.Put("/:id", authMiddleware.RequireRole(models.RoleAdmin), updateNotificationHandler(notificationService))
+	notifications.Delete("/:id", authMiddleware.RequireRole(models.RoleAdmin), deleteNotificationHandler(notificationService))
+	notifications.Post("/:id/test", testNotificationHandler(notificationService))
+	notifications.Post("/send", authMiddleware.RequireRole(models.RoleAdmin), sendNotificationHandler(notificationService))
+}
+
+// listNotificationsHandler godoc
+// @Summary List notifications
+// @Description Get all notification channels
+// @Tags notifications
+// @Accept json
+// @Produce json
+// @Success 200 {array} models.Notification
+// @Security BearerAuth
+// @Router /notifications [get]
+func listNotificationsHandler(notificationService *services.NotificationService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		notifications, err := notificationService.GetNotifications()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -47,18 +61,21 @@ func RegisterNotificationRoutes(api fiber.Router, notificationService *services.
 		}
 
 		return c.JSON(notifications)
-	})
+	}
+}
 
-	// @Summary Get notification
-	// @Description Get notification channel by ID
-	// @Tags notifications
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Notification ID"
-	// @Success 200 {object} models.Notification
-	// @Security BearerAuth
-	// @Router /notifications/{id} [get]
-	notifications.Get("/:id", func(c *fiber.Ctx) error {
+// getNotificationHandler godoc
+// @Summary Get notification
+// @Description Get notification channel by ID
+// @Tags notifications
+// @Accept json
+// @Produce json
+// @Param id path int true "Notification ID"
+// @Success 200 {object} models.Notification
+// @Security BearerAuth
+// @Router /notifications/{id} [get]
+func getNotificationHandler(notificationService *services.NotificationService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -74,18 +91,21 @@ func RegisterNotificationRoutes(api fiber.Router, notificationService *services.
 		}
 
 		return c.JSON(notification)
-	})
+	}
+}
 
-	// @Summary Create notification
-	// @Description Create a new notification channel
-	// @Tags notifications
-	// @Accept json
-	// @Produce json
-	// @Param request body CreateNotificationRequest true "Notification data"
-	// @Success 201 {object} models.Notification
-	// @Security BearerAuth
-	// @Router /notifications [post]
-	notifications.Post("/", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// createNotificationHandler godoc
+// @Summary Create notification
+// @Description Create a new notification channel
+// @Tags notifications
+// @Accept json
+// @Produce json
+// @Param request body CreateNotificationRequest true "Notification data"
+// @Success 201 {object} models.Notification
+// @Security BearerAuth
+// @Router /notifications [post]
+func createNotificationHandler(notificationService *services.NotificationService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		var req CreateNotificationRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -106,19 +126,22 @@ func RegisterNotificationRoutes(api fiber.Router, notificationService *services.
 		}
 
 		return c.Status(fiber.StatusCreated).JSON(notification)
-	})
+	}
+}
 
-	// @Summary Update notification
-	// @Description Update notification channel
-	// @Tags notifications
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Notification ID"
-	// @Param request body UpdateNotificationRequest true "Notification update data"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /notifications/{id} [put]
-	notifications.Put("/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// updateNotificationHandler godoc
+// @Summary Update notification
+// @Description Update notification channel
+// @Tags notifications
+// @Accept json
+// @Produce json
+// @Param id path int true "Notification ID"
+// @Param request body UpdateNotificationRequest true "Notification update data"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /notifications/{id} [put]
+func updateNotificationHandler(notificationService *services.NotificationService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -147,21 +170,24 @@ func RegisterNotificationRoutes(api fiber.Router, notificationService *services.
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Notification updated successfully",
+		return c.JSON(MessageResponse{
+			Message: "Notification updated successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Delete notification
-	// @Description Delete notification channel
-	// @Tags notifications
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Notification ID"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /notifications/{id} [delete]
-	notifications.Delete("/:id", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// deleteNotificationHandler godoc
+// @Summary Delete notification
+// @Description Delete notification channel
+// @Tags notifications
+// @Accept json
+// @Produce json
+// @Param id path int true "Notification ID"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /notifications/{id} [delete]
+func deleteNotificationHandler(notificationService *services.NotificationService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -175,21 +201,24 @@ func RegisterNotificationRoutes(api fiber.Router, notificationService *services.
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Notification deleted successfully",
+		return c.JSON(MessageResponse{
+			Message: "Notification deleted successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Test notification
-	// @Description Test notification channel
-	// @Tags notifications
-	// @Accept json
-	// @Produce json
-	// @Param id path int true "Notification ID"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /notifications/{id}/test [post]
-	notifications.Post("/:id/test", func(c *fiber.Ctx) error {
+// testNotificationHandler godoc
+// @Summary Test notification
+// @Description Test notification channel
+// @Tags notifications
+// @Accept json
+// @Produce json
+// @Param id path int true "Notification ID"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /notifications/{id}/test [post]
+func testNotificationHandler(notificationService *services.NotificationService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -203,21 +232,24 @@ func RegisterNotificationRoutes(api fiber.Router, notificationService *services.
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Test notification sent successfully",
+		return c.JSON(MessageResponse{
+			Message: "Test notification sent successfully",
 		})
-	})
+	}
+}
 
-	// @Summary Send notification
-	// @Description Send notification to all active channels
-	// @Tags notifications
-	// @Accept json
-	// @Produce json
-	// @Param request body TestNotificationRequest true "Notification message"
-	// @Success 200 {object} map[string]interface{}
-	// @Security BearerAuth
-	// @Router /notifications/send [post]
-	notifications.Post("/send", authMiddleware.RequireRole(models.RoleAdmin), func(c *fiber.Ctx) error {
+// sendNotificationHandler godoc
+// @Summary Send notification
+// @Description Send notification to all active channels
+// @Tags notifications
+// @Accept json
+// @Produce json
+// @Param request body TestNotificationRequest true "Notification message"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /notifications/send [post]
+func sendNotificationHandler(notificationService *services.NotificationService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		var req TestNotificationRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -237,8 +269,8 @@ func RegisterNotificationRoutes(api fiber.Router, notificationService *services.
 			})
 		}
 
-		return c.JSON(fiber.Map{
-			"message": "Notification sent successfully",
+		return c.JSON(MessageResponse{
+			Message: "Notification sent successfully",
 		})
-	})
+	}
 }
