@@ -34,7 +34,7 @@ RUN go mod download && go mod tidy
 COPY . .
 
 # Generate swagger documentation
-RUN swag init -g ./cmd/main.go -o ./docs --parseInternal --generatedTime
+RUN swag init -g ./cmd/main.go -o ./docs
 
 # Build the Go application
 RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o main ./cmd/main.go

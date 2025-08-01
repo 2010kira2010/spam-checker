@@ -22,7 +22,8 @@ import (
 	"github.com/gofiber/swagger"
 	"github.com/sirupsen/logrus"
 
-	_ "spam-checker/docs" // Import generated docs - uncomment after swagger generation
+	_ "spam-checker/docs"            // Import generated docs - uncomment after swagger generation
+	_ "spam-checker/internal/models" // Import models to make types available for swagger
 )
 
 // @title SpamChecker API
