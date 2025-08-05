@@ -42,19 +42,30 @@ import { format } from 'date-fns';
 import axios from 'axios';
 import { useSnackbar } from 'notistack';
 
+interface PhoneNumber {
+    id: number;
+    number: string;
+    description: string;
+    is_active: boolean;
+}
+
 interface CheckResult {
     id: number;
     phone_number_id: number;
-    phone_number: string;
+    phone_number?: string;
     service: {
         id: number;
         name: string;
         code: string;
     };
     is_spam: boolean;
-    found_keywords: string[];
+    found_keywords: string[] | null;
     checked_at: string;
     screenshot: string;
+}
+
+interface CheckResultWithPhone extends CheckResult {
+    phone: PhoneNumber;
 }
 
 const ChecksPage: React.FC = observer(() => {
@@ -63,6 +74,7 @@ const ChecksPage: React.FC = observer(() => {
     const { enqueueSnackbar } = useSnackbar();
 
     const [results, setResults] = useState<CheckResult[]>([]);
+    const [phoneNumbers, setPhoneNumbers] = useState<Map<number, PhoneNumber>>(new Map());
     const [isLoading, setIsLoading] = useState(false);
     const [realtimeNumber, setRealtimeNumber] = useState('');
     const [realtimeLoading, setRealtimeLoading] = useState(false);
@@ -71,6 +83,7 @@ const ChecksPage: React.FC = observer(() => {
         open: boolean;
         url: string;
         title: string;
+        loading?: boolean;
     }>({ open: false, url: '', title: '' });
 
     // Pagination
@@ -91,13 +104,54 @@ const ChecksPage: React.FC = observer(() => {
                     offset: page * rowsPerPage,
                 },
             });
-            setResults(response.data.results || []);
+
+            const checkResults = response.data.results || [];
+            setResults(checkResults);
             setTotalCount(response.data.count || 0);
+
+            // Load phone numbers for the results
+            const phoneIdsSet = new Set<number>();
+            checkResults.forEach((r: CheckResult) => phoneIdsSet.add(r.phone_number_id));
+            const phoneIds = Array.from(phoneIdsSet);
+            if (phoneIds.length > 0) {
+                await loadPhoneNumbers(phoneIds);
+            }
         } catch (error) {
             enqueueSnackbar(t('errors.loadFailed'), { variant: 'error' });
         } finally {
             setIsLoading(false);
         }
+    };
+
+    const loadPhoneNumbers = async (phoneIds: number[]) => {
+        try {
+            // Load phone numbers in batches
+            const phoneMap = new Map<number, PhoneNumber>();
+
+            // Since we don't have a batch endpoint, we'll need to load them from the phones list
+            // This is a workaround - ideally the API should return phone numbers with check results
+            const phonesResponse = await axios.get('/phones', {
+                params: {
+                    limit: 100,
+                    page: 1
+                }
+            });
+
+            phonesResponse.data.phones.forEach((phone: PhoneNumber) => {
+                if (phoneIds.includes(phone.id)) {
+                    phoneMap.set(phone.id, phone);
+                }
+            });
+
+            setPhoneNumbers(phoneMap);
+        } catch (error) {
+            console.error('Failed to load phone numbers:', error);
+        }
+    };
+
+    const getPhoneNumber = (phoneId: number): string => {
+        const phone = phoneNumbers.get(phoneId);
+        return phone ? phone.number : `ID: ${phoneId}`;
     };
 
     const handleRealtimeCheck = async () => {
@@ -136,12 +190,37 @@ const ChecksPage: React.FC = observer(() => {
         }
     };
 
-    const handleViewScreenshot = (result: CheckResult) => {
+    const handleViewScreenshot = async (result: CheckResult) => {
+        const phoneNumber = getPhoneNumber(result.phone_number_id);
         setScreenshotDialog({
             open: true,
-            url: `/checks/screenshot/${result.id}`,
-            title: `${result.phone_number} - ${result.service.name}`,
+            url: '',
+            title: `${phoneNumber} - ${result.service.name}`,
+            loading: true,
         });
+
+        try {
+            // Load screenshot with authentication
+            const response = await axios.get(`/checks/screenshot/${result.id}`, {
+                responseType: 'blob',
+            });
+
+            // Create blob URL
+            const imageUrl = URL.createObjectURL(response.data);
+
+            setScreenshotDialog(prev => ({
+                ...prev,
+                url: imageUrl,
+                loading: false,
+            }));
+        } catch (error) {
+            console.error('Failed to load screenshot:', error);
+            setScreenshotDialog(prev => ({
+                ...prev,
+                url: 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="400" height="300"%3E%3Crect width="400" height="300" fill="%23333"%2F%3E%3Ctext x="50%25" y="50%25" dominant-baseline="middle" text-anchor="middle" fill="%23999" font-family="Arial" font-size="20"%3EScreenshot not available%3C%2Ftext%3E%3C%2Fsvg%3E',
+                loading: false,
+            }));
+        }
     };
 
     const handleChangePage = (event: unknown, newPage: number) => {
@@ -313,7 +392,7 @@ const ChecksPage: React.FC = observer(() => {
                                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                                                 <Phone sx={{ fontSize: 18, color: 'text.secondary' }} />
                                                 <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>
-                                                    {result.phone_number}
+                                                    {getPhoneNumber(result.phone_number_id)}
                                                 </Typography>
                                             </Box>
                                         </TableCell>
@@ -338,7 +417,7 @@ const ChecksPage: React.FC = observer(() => {
                                             )}
                                         </TableCell>
                                         <TableCell>
-                                            {result.found_keywords.length > 0 ? (
+                                            {result.found_keywords && result.found_keywords.length > 0 ? (
                                                 <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
                                                     {result.found_keywords.slice(0, 3).map((keyword, i) => (
                                                         <Chip
@@ -402,7 +481,13 @@ const ChecksPage: React.FC = observer(() => {
             {/* Screenshot Dialog */}
             <Dialog
                 open={screenshotDialog.open}
-                onClose={() => setScreenshotDialog({ open: false, url: '', title: '' })}
+                onClose={() => {
+                    // Clean up blob URL when closing
+                    if (screenshotDialog.url && screenshotDialog.url.startsWith('blob:')) {
+                        URL.revokeObjectURL(screenshotDialog.url);
+                    }
+                    setScreenshotDialog({ open: false, url: '', title: '' });
+                }}
                 maxWidth="md"
                 fullWidth
             >
@@ -410,7 +495,12 @@ const ChecksPage: React.FC = observer(() => {
                     <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                         <Typography variant="h6">{screenshotDialog.title}</Typography>
                         <IconButton
-                            onClick={() => setScreenshotDialog({ open: false, url: '', title: '' })}
+                            onClick={() => {
+                                if (screenshotDialog.url && screenshotDialog.url.startsWith('blob:')) {
+                                    URL.revokeObjectURL(screenshotDialog.url);
+                                }
+                                setScreenshotDialog({ open: false, url: '', title: '' });
+                            }}
                             size="small"
                         >
                             <Close />
@@ -419,17 +509,21 @@ const ChecksPage: React.FC = observer(() => {
                 </DialogTitle>
                 <DialogContent>
                     <Box sx={{ textAlign: 'center', p: 2 }}>
-                        <img
-                            src={screenshotDialog.url}
-                            alt={t('checks.screenshot')}
-                            style={{
-                                maxWidth: '100%',
-                                maxHeight: '70vh',
-                                objectFit: 'contain',
-                                borderRadius: 8,
-                                boxShadow: theme.shadows[3],
-                            }}
-                        />
+                        {screenshotDialog.loading ? (
+                            <CircularProgress />
+                        ) : (
+                            <img
+                                src={screenshotDialog.url}
+                                alt={t('checks.screenshot')}
+                                style={{
+                                    maxWidth: '100%',
+                                    maxHeight: '70vh',
+                                    objectFit: 'contain',
+                                    borderRadius: 8,
+                                    boxShadow: theme.shadows[3],
+                                }}
+                            />
+                        )}
                     </Box>
                 </DialogContent>
             </Dialog>

@@ -11,6 +11,7 @@ import (
 	"spam-checker/internal/config"
 	"spam-checker/internal/models"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -21,6 +22,15 @@ type CheckService struct {
 	db         *gorm.DB
 	cfg        *config.Config
 	adbService *ADBService
+}
+
+// CheckResult for concurrent processing
+type ConcurrentCheckResult struct {
+	PhoneID uint
+	Gateway *models.ADBGateway
+	Service *models.SpamService
+	Error   error
+	Result  *models.CheckResult
 }
 
 // GetDB returns database instance for handlers
@@ -36,7 +46,7 @@ func NewCheckService(db *gorm.DB, cfg *config.Config) *CheckService {
 	}
 }
 
-// CheckPhoneNumber checks a single phone number across all services
+// CheckPhoneNumber checks a single phone number across all services concurrently
 func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 	// Get phone number
 	var phone models.PhoneNumber
@@ -50,40 +60,134 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 		return fmt.Errorf("failed to get active gateways: %w", err)
 	}
 
-	// Check on each gateway
+	if len(gateways) == 0 {
+		return fmt.Errorf("no active gateways available")
+	}
+
+	logrus.Infof("Starting concurrent check for phone %s across %d gateways", phone.Number, len(gateways))
+
+	// Create a channel for results
+	resultChan := make(chan ConcurrentCheckResult, len(gateways))
+	var wg sync.WaitGroup
+
+	// Check on each gateway concurrently
 	for _, gateway := range gateways {
-		if err := s.checkOnGateway(&phone, &gateway); err != nil {
-			logrus.Errorf("Failed to check phone %s on gateway %s: %v", phone.Number, gateway.Name, err)
-			continue
+		wg.Add(1)
+		go func(gw models.ADBGateway) {
+			defer wg.Done()
+
+			// Get service info
+			var service models.SpamService
+			if err := s.db.Where("code = ?", gw.ServiceCode).First(&service).Error; err != nil {
+				resultChan <- ConcurrentCheckResult{
+					PhoneID: phone.ID,
+					Gateway: &gw,
+					Error:   fmt.Errorf("service not found: %w", err),
+				}
+				return
+			}
+
+			// Perform check
+			result := ConcurrentCheckResult{
+				PhoneID: phone.ID,
+				Gateway: &gw,
+				Service: &service,
+			}
+
+			if err := s.checkOnGateway(&phone, &gw); err != nil {
+				result.Error = err
+				logrus.Errorf("Failed to check phone %s on gateway %s: %v", phone.Number, gw.Name, err)
+			} else {
+				// Get the created result
+				var checkResult models.CheckResult
+				if err := s.db.Where("phone_number_id = ? AND service_id = ?", phone.ID, service.ID).
+					Order("checked_at DESC").First(&checkResult).Error; err == nil {
+					result.Result = &checkResult
+				}
+			}
+
+			resultChan <- result
+		}(gateway)
+	}
+
+	// Close channel when all goroutines complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	successCount := 0
+	errorCount := 0
+	for result := range resultChan {
+		if result.Error != nil {
+			errorCount++
+		} else {
+			successCount++
 		}
+	}
+
+	logrus.Infof("Concurrent check completed for phone %s: %d successful, %d failed",
+		phone.Number, successCount, errorCount)
+
+	if successCount == 0 && errorCount > 0 {
+		return fmt.Errorf("all checks failed for phone %s", phone.Number)
 	}
 
 	return nil
 }
 
-// CheckAllPhones checks all active phone numbers
+// CheckAllPhones checks all active phone numbers with concurrent processing
 func (s *CheckService) CheckAllPhones() error {
 	phones, err := NewPhoneService(s.db).GetActivePhones()
 	if err != nil {
 		return fmt.Errorf("failed to get active phones: %w", err)
 	}
 
-	logrus.Infof("Starting check for %d phones", len(phones))
+	if len(phones) == 0 {
+		logrus.Info("No active phones to check")
+		return nil
+	}
+
+	// Get max concurrent checks setting
+	var maxConcurrent int = 3 // default
+	if setting, err := NewSettingsService(s.db).GetSettingValue("max_concurrent_checks"); err == nil {
+		if val, ok := setting.(int); ok && val > 0 {
+			maxConcurrent = val
+		}
+	}
+
+	logrus.Infof("Starting check for %d phones with max %d concurrent checks", len(phones), maxConcurrent)
+
+	// Create semaphore channel to limit concurrent phone checks
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
 
 	for _, phone := range phones {
-		if err := s.CheckPhoneNumber(phone.ID); err != nil {
-			logrus.Errorf("Failed to check phone %s: %v", phone.Number, err)
-			continue
-		}
+		wg.Add(1)
+		go func(p models.PhoneNumber) {
+			defer wg.Done()
 
-		// Small delay between checks
-		time.Sleep(2 * time.Second)
+			// Acquire semaphore
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			if err := s.CheckPhoneNumber(p.ID); err != nil {
+				logrus.Errorf("Failed to check phone %s: %v", p.Number, err)
+			}
+
+			// Small delay between phone checks to avoid overwhelming the system
+			time.Sleep(1 * time.Second)
+		}(phone)
 	}
+
+	wg.Wait()
+	logrus.Info("All phone checks completed")
 
 	return nil
 }
 
-// checkOnGateway checks phone on specific gateway
+// checkOnGateway checks phone on specific gateway (unchanged from original)
 func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models.ADBGateway) error {
 	// Get service info
 	var service models.SpamService
@@ -91,7 +195,7 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 		return fmt.Errorf("service not found: %w", err)
 	}
 
-	logrus.Infof("Checking %s on %s", phone.Number, service.Name)
+	logrus.Infof("Checking %s on %s (gateway: %s)", phone.Number, service.Name, gateway.Name)
 
 	// Since apps are pre-installed, we just need to ensure the app is running
 	appPackage, appActivity := s.getAppInfo(gateway.ServiceCode)
@@ -168,6 +272,59 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 
 	logrus.Infof("Check completed for %s on %s: isSpam=%v, keywords=%v",
 		phone.Number, service.Name, isSpam, foundKeywords)
+
+	return nil
+}
+
+// CheckPhoneNumbersInBatch checks multiple phone numbers concurrently
+func (s *CheckService) CheckPhoneNumbersInBatch(phoneIDs []uint) error {
+	if len(phoneIDs) == 0 {
+		return nil
+	}
+
+	// Get max concurrent checks setting
+	var maxConcurrent int = 3
+	if setting, err := NewSettingsService(s.db).GetSettingValue("max_concurrent_checks"); err == nil {
+		if val, ok := setting.(int); ok && val > 0 {
+			maxConcurrent = val
+		}
+	}
+
+	logrus.Infof("Starting batch check for %d phones with max %d concurrent", len(phoneIDs), maxConcurrent)
+
+	// Create semaphore channel
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	errorChan := make(chan error, len(phoneIDs))
+
+	for _, phoneID := range phoneIDs {
+		wg.Add(1)
+		go func(id uint) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			if err := s.CheckPhoneNumber(id); err != nil {
+				errorChan <- fmt.Errorf("phone %d: %w", id, err)
+			}
+		}(phoneID)
+	}
+
+	// Wait for all checks to complete
+	wg.Wait()
+	close(errorChan)
+
+	// Collect errors
+	var errors []error
+	for err := range errorChan {
+		errors = append(errors, err)
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("batch check completed with %d errors", len(errors))
+	}
 
 	return nil
 }
@@ -345,7 +502,7 @@ func (s *CheckService) GetLatestResults() ([]map[string]interface{}, error) {
 	return results, nil
 }
 
-// CheckPhoneRealtime checks phone number in real-time
+// CheckPhoneRealtime checks phone number in real-time with concurrent processing
 func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interface{}, error) {
 	// Normalize phone number
 	phoneNumber = NewPhoneService(s.db).normalizePhoneNumber(phoneNumber)
@@ -379,34 +536,60 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 	results["checked_at"] = time.Now()
 
 	var serviceResults []map[string]interface{}
+	resultChan := make(chan map[string]interface{}, len(gateways))
+	var wg sync.WaitGroup
 
-	// Check on each gateway
+	// Check on each gateway concurrently
 	for _, gateway := range gateways {
-		// Get service info
-		var service models.SpamService
-		if err := s.db.Where("code = ?", gateway.ServiceCode).First(&service).Error; err != nil {
-			continue
-		}
+		wg.Add(1)
+		go func(gw models.ADBGateway) {
+			defer wg.Done()
 
-		// Perform check
-		if err := s.checkOnGateway(tempPhone, &gateway); err != nil {
-			serviceResults = append(serviceResults, map[string]interface{}{
-				"service": service.Name,
-				"error":   err.Error(),
-			})
-			continue
-		}
+			// Get service info
+			var service models.SpamService
+			if err := s.db.Where("code = ?", gw.ServiceCode).First(&service).Error; err != nil {
+				resultChan <- map[string]interface{}{
+					"service": "Unknown",
+					"error":   err.Error(),
+				}
+				return
+			}
 
-		// Get result
-		var checkResult models.CheckResult
-		if err := s.db.Where("phone_number_id = ? AND service_id = ?", tempPhone.ID, service.ID).
-			Order("checked_at DESC").First(&checkResult).Error; err == nil {
-			serviceResults = append(serviceResults, map[string]interface{}{
-				"service":        service.Name,
-				"is_spam":        checkResult.IsSpam,
-				"found_keywords": checkResult.FoundKeywords,
-			})
-		}
+			// Perform check
+			if err := s.checkOnGateway(tempPhone, &gw); err != nil {
+				resultChan <- map[string]interface{}{
+					"service": service.Name,
+					"error":   err.Error(),
+				}
+				return
+			}
+
+			// Get result
+			var checkResult models.CheckResult
+			if err := s.db.Where("phone_number_id = ? AND service_id = ?", tempPhone.ID, service.ID).
+				Order("checked_at DESC").First(&checkResult).Error; err == nil {
+				resultChan <- map[string]interface{}{
+					"service":        service.Name,
+					"is_spam":        checkResult.IsSpam,
+					"found_keywords": checkResult.FoundKeywords,
+				}
+			} else {
+				resultChan <- map[string]interface{}{
+					"service": service.Name,
+					"error":   "Result not found",
+				}
+			}
+		}(gateway)
+	}
+
+	// Collect results
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	for result := range resultChan {
+		serviceResults = append(serviceResults, result)
 	}
 
 	results["results"] = serviceResults

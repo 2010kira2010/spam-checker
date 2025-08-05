@@ -56,6 +56,7 @@ services:
     ports:
       - "6080:6080"  # noVNC
       - "5554:5554"  # ADB
+      - "5555:5555"  # ADB
     volumes:
       - android_yandex_data:/data
     shm_size: 4gb
@@ -78,6 +79,7 @@ services:
     ports:
       - "6081:6080"  # noVNC
       - "5556:5554"  # ADB
+      - "5557:5555"  # ADB
     volumes:
       - android_kaspersky_data:/data
     shm_size: 4gb
@@ -99,7 +101,8 @@ services:
       - EMULATOR_MEMORY=4096
     ports:
       - "6082:6080"  # noVNC
-      - "5557:5554"  # ADB
+      - "5558:5554"  # ADB
+      - "5559:5555"  # ADB
     volumes:
       - android_kaspersky_data:/data
     shm_size: 4gb
