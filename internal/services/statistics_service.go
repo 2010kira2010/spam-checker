@@ -302,11 +302,11 @@ func (s *StatisticsService) GetRecentSpamDetections(limit int) ([]map[string]int
 	`
 
 	var results []struct {
-		Number        string    `gorm:"column:number"`
-		Description   string    `gorm:"column:description"`
-		CheckedAt     time.Time `gorm:"column:checked_at"`
-		ServiceName   string    `gorm:"column:service_name"`
-		FoundKeywords []string  `gorm:"column:found_keywords;type:text[]"`
+		Number        string             `gorm:"column:number"`
+		Description   string             `gorm:"column:description"`
+		CheckedAt     time.Time          `gorm:"column:checked_at"`
+		ServiceName   string             `gorm:"column:service_name"`
+		FoundKeywords models.StringArray `gorm:"column:found_keywords;type:text[]"`
 	}
 
 	if err := s.db.Raw(query, limit).Scan(&results).Error; err != nil {
@@ -320,7 +320,7 @@ func (s *StatisticsService) GetRecentSpamDetections(limit int) ([]map[string]int
 			"description":    result.Description,
 			"checked_at":     result.CheckedAt,
 			"service_name":   result.ServiceName,
-			"found_keywords": result.FoundKeywords,
+			"found_keywords": []string(result.FoundKeywords), // Convert back to []string for JSON
 		}
 	}
 

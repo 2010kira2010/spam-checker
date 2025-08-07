@@ -489,19 +489,28 @@ func (s *ADBService) SimulateIncomingCall(gatewayID uint, phoneNumber string) er
 
 	containerName := s.getContainerName(gateway)
 
+	// Normalize phone number for GSM emulator - only digits allowed
+	// Remove all non-digit characters
+	normalizedNumber := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, phoneNumber)
+
 	// Simulate incoming call using emulator console
-	output, err := s.executeInContainer(containerName, []string{"adb", "emu", "gsm", "call", phoneNumber})
+	output, err := s.executeInContainer(containerName, []string{"adb", "emu", "gsm", "call", normalizedNumber})
 	if err != nil {
 		return fmt.Errorf("failed to simulate call: %w, output: %s", err, output)
 	}
 
-	logrus.Infof("Simulated incoming call from %s on gateway %s", phoneNumber, gateway.Name)
+	logrus.Infof("Simulated incoming call from %s on gateway %s", normalizedNumber, gateway.Name)
 
 	return nil
 }
 
 // EndCall ends current call
-func (s *ADBService) EndCall(gatewayID uint) error {
+func (s *ADBService) EndCall(gatewayID uint, phoneNumber string) error {
 	gateway, err := s.GetGatewayByID(gatewayID)
 	if err != nil {
 		return err
@@ -509,15 +518,30 @@ func (s *ADBService) EndCall(gatewayID uint) error {
 
 	containerName := s.getContainerName(gateway)
 
-	// End call using emulator console
-	output, err := s.executeInContainer(containerName, []string{"adb", "emu", "gsm", "cancel", "inbound"})
+	// Try different methods to end call
+	// Method 1: Try to cancel via GSM emulator (without phone number)
+	output, err := s.executeInContainer(containerName, []string{"adb", "emu", "gsm", "cancel", phoneNumber})
 	if err != nil {
-		// Try key event as fallback
-		return s.SendKeyEvent(gatewayID, "KEYCODE_ENDCALL")
+		logrus.Warnf("Failed to cancel call via GSM emulator: %v", err)
+
+		// Method 2: Use key event as fallback
+		err = s.SendKeyEvent(gatewayID, "KEYCODE_ENDCALL")
+		if err != nil {
+			logrus.Warnf("Failed to end call via KEYCODE_ENDCALL: %v", err)
+
+			// Method 3: Try HOME key to dismiss call screen
+			err = s.SendKeyEvent(gatewayID, "KEYCODE_HOME")
+			if err != nil {
+				return fmt.Errorf("failed to end call using all methods")
+			}
+			logrus.Info("Dismissed call screen using HOME key")
+			return nil
+		}
+		logrus.Info("Ended call using KEYCODE_ENDCALL")
+		return nil
 	}
 
 	logrus.Infof("Ended call on gateway %s: %s", gateway.Name, output)
-
 	return nil
 }
 

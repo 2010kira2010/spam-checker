@@ -1,7 +1,9 @@
 package models
 
 import (
+	"database/sql/driver"
 	"gorm.io/gorm"
+	"strings"
 	"time"
 )
 
@@ -51,6 +53,111 @@ type SpamService struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// StringArray custom type for PostgreSQL text[] array
+type StringArray []string
+
+// Scan implements sql.Scanner interface for StringArray
+func (a *StringArray) Scan(value interface{}) error {
+	if value == nil {
+		*a = []string{}
+		return nil
+	}
+
+	switch v := value.(type) {
+	case []byte:
+		return a.scanBytes(v)
+	case string:
+		return a.scanBytes([]byte(v))
+	case []string:
+		*a = v
+		return nil
+	default:
+		*a = []string{}
+		return nil
+	}
+}
+
+// scanBytes parses PostgreSQL array format
+func (a *StringArray) scanBytes(src []byte) error {
+	strValue := string(src)
+	*a = []string{}
+
+	// Handle empty array
+	if strValue == "{}" || strValue == "" {
+		return nil
+	}
+
+	// Remove curly braces
+	strValue = strings.TrimPrefix(strValue, "{")
+	strValue = strings.TrimSuffix(strValue, "}")
+
+	// Handle empty content
+	if strValue == "" {
+		return nil
+	}
+
+	// Split by comma, handling quoted values
+	elements := []string{}
+	current := ""
+	inQuotes := false
+	escaped := false
+
+	for _, char := range strValue {
+		if escaped {
+			current += string(char)
+			escaped = false
+			continue
+		}
+
+		switch char {
+		case '\\':
+			escaped = true
+		case '"':
+			inQuotes = !inQuotes
+		case ',':
+			if !inQuotes {
+				elements = append(elements, strings.Trim(current, `"`))
+				current = ""
+			} else {
+				current += string(char)
+			}
+		default:
+			current += string(char)
+		}
+	}
+
+	// Add last element
+	if current != "" {
+		elements = append(elements, strings.Trim(current, `"`))
+	}
+
+	*a = elements
+	return nil
+}
+
+// Value implements driver.Valuer interface for StringArray
+func (a StringArray) Value() (driver.Value, error) {
+	if len(a) == 0 {
+		return "{}", nil
+	}
+
+	// Build PostgreSQL array format
+	elements := make([]string, len(a))
+	for i, v := range a {
+		// Escape special characters
+		v = strings.ReplaceAll(v, `\`, `\\`)
+		v = strings.ReplaceAll(v, `"`, `\"`)
+		// Quote if contains comma, space, or special chars
+		if strings.ContainsAny(v, `, {}"\`) || v == "" {
+			elements[i] = `"` + v + `"`
+		} else {
+			elements[i] = v
+		}
+	}
+
+	return "{" + strings.Join(elements, ",") + "}", nil
+}
+
 // CheckResult represents spam check result
 type CheckResult struct {
 	ID            uint        `gorm:"primaryKey" json:"id"`
@@ -59,7 +166,7 @@ type CheckResult struct {
 	ServiceID     uint        `json:"service_id"`
 	Service       SpamService `gorm:"foreignKey:ServiceID" json:"service"`
 	IsSpam        bool        `json:"is_spam"`
-	FoundKeywords []string    `gorm:"type:text[]" json:"found_keywords"`
+	FoundKeywords StringArray `gorm:"type:text[]" json:"found_keywords"`
 	Screenshot    string      `json:"screenshot"`
 	RawText       string      `json:"raw_text"`
 	CheckedAt     time.Time   `json:"checked_at"`
