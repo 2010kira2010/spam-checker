@@ -198,6 +198,7 @@ export const en = {
         online: 'Online',
         offline: 'Offline',
         restarting: 'Restarting',
+        creating: 'Creating',
         // OCR
         tesseractPath: 'Tesseract Path',
         tesseractPathHelp: 'Path to Tesseract OCR executable',

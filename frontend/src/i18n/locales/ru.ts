@@ -198,6 +198,7 @@ export const ru = {
         online: 'Онлайн',
         offline: 'Оффлайн',
         restarting: 'Перезапуск',
+        creating: 'Создание',
         // OCR
         tesseractPath: 'Путь к Tesseract',
         tesseractPathHelp: 'Путь к исполняемому файлу Tesseract OCR',

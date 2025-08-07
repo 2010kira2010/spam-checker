@@ -55,6 +55,7 @@ type SwaggerConfig struct {
 
 type DockerConfig struct {
 	Host string
+	Port string
 }
 
 func Load() (*Config, error) {
@@ -100,6 +101,7 @@ func Load() (*Config, error) {
 		},
 		Docker: DockerConfig{
 			Host: getEnv("DOCKER_HOST", "tcp://localhost:2375"),
+			Port: getEnv("DOCKER_PORT", "2375"),
 		},
 	}
 

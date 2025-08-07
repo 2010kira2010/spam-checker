@@ -84,6 +84,9 @@ func main() {
 		AppName:               cfg.App.Name,
 		DisableStartupMessage: false,
 		ErrorHandler:          customErrorHandler,
+		BodyLimit:             500 * 1024 * 1024, // 500 MB limit for APK files
+		ReadTimeout:           5 * time.Minute,   // Increase timeout for large uploads
+		WriteTimeout:          5 * time.Minute,
 	})
 
 	// Middleware

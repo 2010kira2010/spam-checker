@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"spam-checker/internal/middleware"
 	"spam-checker/internal/models"
@@ -14,9 +15,10 @@ import (
 // CreateADBGatewayRequest represents ADB gateway creation request
 type CreateADBGatewayRequest struct {
 	Name        string `json:"name" validate:"required"`
-	Host        string `json:"host" validate:"required"`
-	Port        int    `json:"port" validate:"required,min=1,max=65535"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
 	ServiceCode string `json:"service_code" validate:"required,oneof=yandex_aon kaspersky getcontact"`
+	IsDocker    bool   `json:"is_docker"`
 }
 
 // UpdateADBGatewayRequest represents ADB gateway update request
@@ -54,6 +56,7 @@ func RegisterADBRoutes(api fiber.Router, adbService *services.ADBService, authMi
 	adb.Get("/gateways", listGatewaysHandler(adbService))
 	adb.Get("/gateways/:id", getGatewayHandler(adbService))
 	adb.Post("/gateways", authMiddleware.RequireRole(models.RoleAdmin), createGatewayHandler(adbService))
+	adb.Post("/gateways/docker", authMiddleware.RequireRole(models.RoleAdmin), createDockerGatewayHandler(adbService))
 	adb.Put("/gateways/:id", authMiddleware.RequireRole(models.RoleAdmin), updateGatewayHandler(adbService))
 	adb.Delete("/gateways/:id", authMiddleware.RequireRole(models.RoleAdmin), deleteGatewayHandler(adbService))
 	adb.Post("/gateways/:id/status", updateGatewayStatusHandler(adbService))
@@ -137,6 +140,15 @@ func createGatewayHandler(adbService *services.ADBService) fiber.Handler {
 			})
 		}
 
+		// Validate based on gateway type
+		if !req.IsDocker {
+			if req.Host == "" || req.Port == 0 {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+					"error": "Host and port are required for manual gateways",
+				})
+			}
+		}
+
 		gateway := &models.ADBGateway{
 			Name:        req.Name,
 			Host:        req.Host,
@@ -144,9 +156,84 @@ func createGatewayHandler(adbService *services.ADBService) fiber.Handler {
 			ServiceCode: req.ServiceCode,
 			IsActive:    true,
 			Status:      "offline",
+			IsDocker:    false, // Always false for manual creation
 		}
 
 		if err := adbService.CreateGateway(gateway); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+		}
+
+		return c.Status(fiber.StatusCreated).JSON(gateway)
+	}
+}
+
+// createDockerGatewayHandler godoc
+// @Summary Create Docker ADB gateway
+// @Description Create a new Docker-based ADB gateway with APK installation
+// @Tags adb
+// @Accept multipart/form-data
+// @Produce json
+// @Param name formData string true "Gateway name"
+// @Param service_code formData string true "Service code (yandex_aon, kaspersky, getcontact)"
+// @Param apk formData file false "APK file to install"
+// @Success 201 {object} models.ADBGateway
+// @Security BearerAuth
+// @Router /adb/gateways/docker [post]
+func createDockerGatewayHandler(adbService *services.ADBService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		// Parse form data
+		name := c.FormValue("name")
+		serviceCode := c.FormValue("service_code")
+
+		if name == "" || serviceCode == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Name and service_code are required",
+			})
+		}
+
+		// Validate service code
+		validServices := map[string]bool{
+			"yandex_aon": true,
+			"kaspersky":  true,
+			"getcontact": true,
+		}
+
+		if !validServices[serviceCode] {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid service code",
+			})
+		}
+
+		// Read APK file if provided
+		var apkData []byte
+		if file, err := c.FormFile("apk"); err == nil {
+			src, err := file.Open()
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error": "Failed to open APK file",
+				})
+			}
+			defer src.Close()
+
+			apkData, err = io.ReadAll(src)
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error": "Failed to read APK file",
+				})
+			}
+		}
+
+		gateway := &models.ADBGateway{
+			Name:        name,
+			ServiceCode: serviceCode,
+			IsActive:    true,
+			Status:      "creating",
+			IsDocker:    true,
+		}
+
+		if err := adbService.CreateDockerGateway(gateway, apkData); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": err.Error(),
 			})

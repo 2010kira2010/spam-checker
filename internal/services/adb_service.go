@@ -11,11 +11,15 @@ import (
 	"spam-checker/internal/config"
 	"spam-checker/internal/models"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	"github.com/docker/go-connections/nat"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
@@ -24,6 +28,58 @@ type ADBService struct {
 	db           *gorm.DB
 	dockerClient *client.Client
 	cfg          *config.Config
+	portManager  *PortManager
+}
+
+// PortManager manages port allocation for containers
+type PortManager struct {
+	mu        sync.Mutex
+	usedPorts map[int]bool
+	baseVNC   int
+	baseADB1  int
+	baseADB2  int
+}
+
+func NewPortManager() *PortManager {
+	return &PortManager{
+		usedPorts: make(map[int]bool),
+		baseVNC:   6080,
+		baseADB1:  5554,
+		baseADB2:  5555,
+	}
+}
+
+func (pm *PortManager) AllocatePorts(gatewayID uint) (vncPort, adbPort1, adbPort2 int, err error) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	// Calculate port offset based on gateway ID
+	offset := int(gatewayID)
+
+	// Find available ports
+	for i := 0; i < 100; i++ {
+		vncPort = pm.baseVNC + offset + i
+		adbPort1 = pm.baseADB1 + (offset+i)*2
+		adbPort2 = pm.baseADB2 + (offset+i)*2
+
+		if !pm.usedPorts[vncPort] && !pm.usedPorts[adbPort1] && !pm.usedPorts[adbPort2] {
+			pm.usedPorts[vncPort] = true
+			pm.usedPorts[adbPort1] = true
+			pm.usedPorts[adbPort2] = true
+			return vncPort, adbPort1, adbPort2, nil
+		}
+	}
+
+	return 0, 0, 0, fmt.Errorf("no available ports found")
+}
+
+func (pm *PortManager) ReleasePorts(vncPort, adbPort1, adbPort2 int) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	delete(pm.usedPorts, vncPort)
+	delete(pm.usedPorts, adbPort1)
+	delete(pm.usedPorts, adbPort2)
 }
 
 func NewADBService(db *gorm.DB, cfg *config.Config) *ADBService {
@@ -34,7 +90,7 @@ func NewADBServiceWithConfig(db *gorm.DB, cfg *config.Config) *ADBService {
 	// Initialize Docker client
 	dockerHost := "unix:///var/run/docker.sock"
 	if cfg != nil && cfg.Docker.Host != "" {
-		dockerHost = cfg.Docker.Host
+		dockerHost = fmt.Sprintf("tcp://%s:%s", cfg.Docker.Host, cfg.Docker.Port)
 	}
 
 	dockerClient, err := client.NewClientWithOpts(
@@ -45,10 +101,30 @@ func NewADBServiceWithConfig(db *gorm.DB, cfg *config.Config) *ADBService {
 		logrus.Errorf("Failed to create Docker client: %v", err)
 	}
 
+	// Initialize port manager and load used ports from existing gateways
+	portManager := NewPortManager()
+
+	// Load existing gateways to mark used ports
+	var gateways []models.ADBGateway
+	if err := db.Find(&gateways).Error; err == nil {
+		for _, gw := range gateways {
+			if gw.VNCPort > 0 {
+				portManager.usedPorts[gw.VNCPort] = true
+			}
+			if gw.ADBPort1 > 0 {
+				portManager.usedPorts[gw.ADBPort1] = true
+			}
+			if gw.ADBPort2 > 0 {
+				portManager.usedPorts[gw.ADBPort2] = true
+			}
+		}
+	}
+
 	return &ADBService{
 		db:           db,
 		dockerClient: dockerClient,
 		cfg:          cfg,
+		portManager:  portManager,
 	}
 }
 
@@ -61,6 +137,214 @@ func (s *ADBService) CreateGateway(gateway *models.ADBGateway) error {
 	// Test connection
 	go s.UpdateGatewayStatus(gateway.ID)
 
+	return nil
+}
+
+// CreateDockerGateway creates a new Docker-based ADB gateway
+func (s *ADBService) CreateDockerGateway(gateway *models.ADBGateway, apkData []byte) error {
+	if s.dockerClient == nil {
+		return fmt.Errorf("Docker client is not initialized")
+	}
+
+	// Allocate ports
+	vncPort, adbPort1, adbPort2, err := s.portManager.AllocatePorts(gateway.ID)
+	if err != nil {
+		return fmt.Errorf("failed to allocate ports: %w", err)
+	}
+
+	gateway.VNCPort = vncPort
+	gateway.ADBPort1 = adbPort1
+	gateway.ADBPort2 = adbPort2
+	gateway.Host = s.cfg.Docker.Host
+	gateway.Port = adbPort1
+	gateway.IsDocker = true
+
+	// Save gateway first to get ID
+	if err := s.db.Create(gateway).Error; err != nil {
+		s.portManager.ReleasePorts(vncPort, adbPort1, adbPort2)
+		return fmt.Errorf("failed to create gateway: %w", err)
+	}
+
+	// Create container
+	containerName := fmt.Sprintf("spam_checker_android_%s", strings.ToLower(strings.ReplaceAll(gateway.Name, " ", "_")))
+	volumeName := fmt.Sprintf("android_%s_data", strings.ToLower(strings.ReplaceAll(gateway.Name, " ", "_")))
+
+	// Container configuration
+	config := &container.Config{
+		Image: "budtmo/docker-android:emulator_10.0",
+		Env: []string{
+			"EMULATOR_DEVICE=Samsung Galaxy S10",
+			"WEB_VNC=true",
+			"WEB_VNC_PORT=6080",
+			"DATAPARTITION=10g",
+			"EMULATOR_MEMORY=4096",
+		},
+		Hostname: containerName,
+	}
+
+	// Host configuration
+	hostConfig := &container.HostConfig{
+		Privileged: true,
+		Resources: container.Resources{
+			Devices: []container.DeviceMapping{
+				{
+					PathOnHost:      "/dev/kvm",
+					PathInContainer: "/dev/kvm",
+				},
+			},
+		},
+		PortBindings: nat.PortMap{
+			"6080/tcp": []nat.PortBinding{{HostPort: fmt.Sprintf("%d", vncPort)}},
+			"5554/tcp": []nat.PortBinding{{HostPort: fmt.Sprintf("%d", adbPort1)}},
+			"5555/tcp": []nat.PortBinding{{HostPort: fmt.Sprintf("%d", adbPort2)}},
+		},
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeVolume,
+				Source: volumeName,
+				Target: "/home/androidusr",
+			},
+		},
+		ShmSize: 4 * 1024 * 1024 * 1024, // 4GB
+		RestartPolicy: container.RestartPolicy{
+			Name: "unless-stopped",
+		},
+	}
+
+	// Network configuration
+	networkConfig := &network.NetworkingConfig{}
+
+	// Create container
+	ctx := context.Background()
+	resp, err := s.dockerClient.ContainerCreate(ctx, config, hostConfig, networkConfig, nil, containerName)
+	if err != nil {
+		s.db.Delete(gateway)
+		s.portManager.ReleasePorts(vncPort, adbPort1, adbPort2)
+		return fmt.Errorf("failed to create container: %w", err)
+	}
+
+	// Update gateway with container ID
+	gateway.DeviceID = containerName
+	gateway.ContainerID = resp.ID
+	if err := s.db.Save(gateway).Error; err != nil {
+		s.dockerClient.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+		s.portManager.ReleasePorts(vncPort, adbPort1, adbPort2)
+		return fmt.Errorf("failed to update gateway: %w", err)
+	}
+
+	// Start container
+	if err := s.dockerClient.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		s.dockerClient.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+		s.db.Delete(gateway)
+		s.portManager.ReleasePorts(vncPort, adbPort1, adbPort2)
+		return fmt.Errorf("failed to start container: %w", err)
+	}
+
+	logrus.Infof("Created Docker container %s for gateway %s", containerName, gateway.Name)
+
+	// Wait for container to be ready
+	go func() {
+		logrus.Info("Waiting for Android emulator to be ready...")
+		time.Sleep(60 * time.Second) // Give emulator time to boot
+
+		// Configure Android system
+		if err := s.configureAndroidSystem(gateway.ID); err != nil {
+			logrus.Errorf("Failed to configure Android system: %v", err)
+		}
+
+		// Install APK if provided
+		if len(apkData) > 0 {
+			logrus.Info("Installing APK...")
+			if err := s.installAPKFromData(gateway.ID, apkData); err != nil {
+				logrus.Errorf("Failed to install APK: %v", err)
+			}
+		}
+
+		// Update gateway status
+		s.UpdateGatewayStatus(gateway.ID)
+	}()
+
+	return nil
+}
+
+// configureAndroidSystem configures Android system settings
+func (s *ADBService) configureAndroidSystem(gatewayID uint) error {
+	// Wait for device to be ready
+	for i := 0; i < 30; i++ {
+		output, err := s.ExecuteCommand(gatewayID, "getprop sys.boot_completed")
+		if err == nil && strings.TrimSpace(output) == "1" {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+
+	// Set language to Russian
+	commands := []string{
+		"settings put system user_rotation 0",
+		"settings put global device_name SpamChecker",
+		"settings put system locale ru-RU",
+		"setprop persist.sys.locale ru-RU",
+		"setprop persist.sys.language ru",
+		"setprop persist.sys.country RU",
+		"am broadcast -a android.intent.action.LOCALE_CHANGED",
+	}
+
+	for _, cmd := range commands {
+		if _, err := s.ExecuteCommand(gatewayID, cmd); err != nil {
+			logrus.Warnf("Failed to execute command '%s': %v", cmd, err)
+		}
+	}
+
+	// Restart system UI to apply changes
+	s.ExecuteCommand(gatewayID, "am restart")
+
+	logrus.Info("Android system configured successfully")
+	return nil
+}
+
+// installAPKFromData installs APK from byte data
+func (s *ADBService) installAPKFromData(gatewayID uint, apkData []byte) error {
+	// Save APK to temporary file
+	tempFile, err := os.CreateTemp("", "app-*.apk")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tempFile.Name())
+
+	if _, err := tempFile.Write(apkData); err != nil {
+		return fmt.Errorf("failed to write APK data: %w", err)
+	}
+	tempFile.Close()
+
+	// Install APK
+	return s.InstallAPK(gatewayID, tempFile.Name())
+}
+
+// DeleteDockerGateway deletes a Docker-based gateway and its container
+func (s *ADBService) DeleteDockerGateway(gateway *models.ADBGateway) error {
+	if !gateway.IsDocker || gateway.ContainerID == "" {
+		return nil
+	}
+
+	ctx := context.Background()
+
+	// Stop container
+	if err := s.dockerClient.ContainerStop(ctx, gateway.ContainerID, container.StopOptions{}); err != nil {
+		logrus.Warnf("Failed to stop container: %v", err)
+	}
+
+	// Remove container
+	if err := s.dockerClient.ContainerRemove(ctx, gateway.ContainerID, container.RemoveOptions{
+		Force:         true,
+		RemoveVolumes: true,
+	}); err != nil {
+		logrus.Warnf("Failed to remove container: %v", err)
+	}
+
+	// Release ports
+	s.portManager.ReleasePorts(gateway.VNCPort, gateway.ADBPort1, gateway.ADBPort2)
+
+	logrus.Infof("Deleted Docker container for gateway %s", gateway.Name)
 	return nil
 }
 
@@ -105,6 +389,18 @@ func (s *ADBService) UpdateGateway(id uint, updates map[string]interface{}) erro
 
 // DeleteGateway deletes a gateway
 func (s *ADBService) DeleteGateway(id uint) error {
+	gateway, err := s.GetGatewayByID(id)
+	if err != nil {
+		return err
+	}
+
+	// Delete Docker container if it's a Docker gateway
+	if gateway.IsDocker {
+		if err := s.DeleteDockerGateway(gateway); err != nil {
+			logrus.Errorf("Failed to delete Docker container: %v", err)
+		}
+	}
+
 	if err := s.db.Delete(&models.ADBGateway{}, id).Error; err != nil {
 		return fmt.Errorf("failed to delete gateway: %w", err)
 	}
@@ -129,24 +425,38 @@ func (s *ADBService) UpdateGatewayStatus(gatewayID uint) error {
 
 	// Check if container is running
 	ctx := context.Background()
-	containers, err := s.dockerClient.ContainerList(ctx, container.ListOptions{})
-	if err != nil {
-		logrus.Errorf("Failed to list containers: %v", err)
-		return err
-	}
 
-	for _, cont := range containers {
-		for _, name := range cont.Names {
-			// Container names in Docker have leading slash
-			if strings.TrimPrefix(name, "/") == containerName {
-				if cont.State == "running" {
-					// Test ADB connection inside container
-					output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
-					if err == nil && strings.Contains(output, "emulator") {
-						status = "online"
+	if gateway.IsDocker && gateway.ContainerID != "" {
+		// Check container by ID for Docker gateways
+		containerInfo, err := s.dockerClient.ContainerInspect(ctx, gateway.ContainerID)
+		if err == nil && containerInfo.State.Running {
+			// Test ADB connection
+			output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
+			if err == nil && strings.Contains(output, "emulator") {
+				status = "online"
+			}
+		}
+	} else {
+		// Check by name for manual gateways
+		containers, err := s.dockerClient.ContainerList(ctx, container.ListOptions{})
+		if err != nil {
+			logrus.Errorf("Failed to list containers: %v", err)
+			return err
+		}
+
+		for _, cont := range containers {
+			for _, name := range cont.Names {
+				// Container names in Docker have leading slash
+				if strings.TrimPrefix(name, "/") == containerName {
+					if cont.State == "running" {
+						// Test ADB connection inside container
+						output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
+						if err == nil && strings.Contains(output, "emulator") {
+							status = "online"
+						}
 					}
+					break
 				}
-				break
 			}
 		}
 	}
@@ -213,6 +523,15 @@ func (s *ADBService) GetDeviceInfo(gatewayID uint) (map[string]string, error) {
 		return nil, err
 	}
 
+	// Add gateway type info
+	if gateway.IsDocker {
+		info["gateway_type"] = "docker"
+		info["vnc_port"] = fmt.Sprintf("%d", gateway.VNCPort)
+		info["vnc_url"] = fmt.Sprintf("http://localhost:%d", gateway.VNCPort)
+	} else {
+		info["gateway_type"] = "manual"
+	}
+
 	containerName := s.getContainerName(gateway)
 
 	// Get device state
@@ -229,6 +548,8 @@ func (s *ADBService) GetDeviceInfo(gatewayID uint) (map[string]string, error) {
 		"model":           "ro.product.model",
 		"device":          "ro.product.device",
 		"brand":           "ro.product.brand",
+		"locale":          "persist.sys.locale",
+		"language":        "persist.sys.language",
 	}
 
 	for key, prop := range props {
@@ -287,6 +608,15 @@ func (s *ADBService) RestartDevice(gatewayID uint) error {
 
 	// Update status to restarting
 	s.db.Model(&models.ADBGateway{}).Where("id = ?", gatewayID).Update("status", "restarting")
+
+	// Wait and reconfigure if it's a Docker gateway
+	if gateway.IsDocker {
+		go func() {
+			time.Sleep(60 * time.Second)
+			s.configureAndroidSystem(gatewayID)
+			s.UpdateGatewayStatus(gatewayID)
+		}()
+	}
 
 	return nil
 }
@@ -672,6 +1002,11 @@ func (s *ADBService) executeInContainer(containerName string, cmd []string) (str
 
 // getContainerName returns Docker container name for gateway
 func (s *ADBService) getContainerName(gateway *models.ADBGateway) string {
+	// For Docker gateways, use the stored device ID
+	if gateway.IsDocker && gateway.DeviceID != "" {
+		return gateway.DeviceID
+	}
+
 	// Map gateway to container name based on service code
 	switch gateway.ServiceCode {
 	case "yandex_aon":

@@ -183,6 +183,11 @@ type ADBGateway struct {
 	ServiceCode string     `json:"service_code"`
 	IsActive    bool       `gorm:"default:true" json:"is_active"`
 	Status      string     `gorm:"default:offline" json:"status"`
+	IsDocker    bool       `gorm:"default:false" json:"is_docker"`
+	ContainerID string     `json:"container_id"`
+	VNCPort     int        `json:"vnc_port"`
+	ADBPort1    int        `json:"adb_port1"`
+	ADBPort2    int        `json:"adb_port2"`
 	LastPing    *time.Time `json:"last_ping"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`

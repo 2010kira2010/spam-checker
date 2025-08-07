@@ -1,6 +1,8 @@
+
 import React, { useState, useEffect } from 'react';
 import { observer } from 'mobx-react-lite';
 import { useTranslation } from 'react-i18next';
+import { mdiDocker } from '@mdi/js';
 import {
     Box,
     Card,
@@ -31,6 +33,11 @@ import {
     InputLabel,
     Tooltip,
     CircularProgress,
+    Radio,
+    RadioGroup,
+    Divider,
+    SvgIcon,
+    SvgIconProps,
 } from '@mui/material';
 import {
     Settings as SettingsIcon,
@@ -44,10 +51,12 @@ import {
     Add,
     Edit,
     Delete,
-    PlayArrow,
     WifiTethering,
     Refresh,
     Language,
+    Computer,
+    CloudUpload,
+    OpenInNew,
 } from '@mui/icons-material';
 import { useSnackbar } from 'notistack';
 import axios from 'axios';
@@ -70,6 +79,11 @@ interface ADBGateway {
     status: string;
     device_id?: string;
     last_ping?: string;
+    is_docker: boolean;
+    container_id?: string;
+    vnc_port?: number;
+    adb_port1?: number;
+    adb_port2?: number;
 }
 
 interface SpamKeyword {
@@ -117,6 +131,14 @@ function TabPanel(props: TabPanelProps) {
     );
 }
 
+function DockerIcon(props: SvgIconProps) {
+    return (
+        <SvgIcon {...props}>
+            <path d={mdiDocker} />
+        </SvgIcon>
+    );
+}
+
 const SettingsPage: React.FC = observer(() => {
     const { t, i18n } = useTranslation();
     const { enqueueSnackbar } = useSnackbar();
@@ -136,6 +158,8 @@ const SettingsPage: React.FC = observer(() => {
     const [adbGateways, setAdbGateways] = useState<ADBGateway[]>([]);
     const [adbDialogOpen, setAdbDialogOpen] = useState(false);
     const [editingGateway, setEditingGateway] = useState<ADBGateway | null>(null);
+    const [gatewayCreationType, setGatewayCreationType] = useState<'manual' | 'docker'>('manual');
+    const [dockerAPKFile, setDockerAPKFile] = useState<File | null>(null);
 
     // Keywords
     const [keywords, setKeywords] = useState<SpamKeyword[]>([]);
@@ -194,59 +218,45 @@ const SettingsPage: React.FC = observer(() => {
         setTabValue(newValue);
     };
 
-    const handleSaveGeneralSettings = async () => {
-        try {
-            const updates = Object.entries(generalSettings).map(([key, value]) => ({
-                key,
-                value: value.toString(),
-            }));
-
-            await Promise.all(updates.map(update =>
-                axios.put(`/settings/${update.key}`, { value: update.value })
-            ));
-
-            enqueueSnackbar(t('settings.settingsSaved'), { variant: 'success' });
-        } catch (error) {
-            enqueueSnackbar(t('errors.saveFailed'), { variant: 'error' });
-        }
-    };
-
-    const changeLanguage = (lng: string) => {
-        i18n.changeLanguage(lng);
-    };
-
-    // ADB Gateway handlers
-    const handleAddGateway = () => {
-        setEditingGateway({
-            id: 0,
-            name: '',
-            host: '',
-            port: 5554,
-            service_code: 'yandex_aon',
-            is_active: true,
-            status: 'offline',
-        });
-        setAdbDialogOpen(true);
-    };
-
-    const handleEditGateway = (gateway: ADBGateway) => {
-        setEditingGateway(gateway);
-        setAdbDialogOpen(true);
-    };
-
     const handleSaveGateway = async () => {
         if (!editingGateway) return;
 
         try {
             if (editingGateway.id === 0) {
-                const res = await axios.post('/adb/gateways', editingGateway);
-                setAdbGateways([...adbGateways, res.data]);
+                if (gatewayCreationType === 'docker') {
+                    // Create Docker gateway
+                    const formData = new FormData();
+                    formData.append('name', editingGateway.name);
+                    formData.append('service_code', editingGateway.service_code);
+                    if (dockerAPKFile) {
+                        formData.append('apk', dockerAPKFile);
+                    }
+
+                    const res = await axios.post('/adb/gateways/docker', formData, {
+                        headers: {
+                            'Content-Type': 'multipart/form-data',
+                        },
+                    });
+                    setAdbGateways([...adbGateways, res.data]);
+                    enqueueSnackbar('Docker gateway creation started. It may take a few minutes to be ready.', { variant: 'info' });
+                } else {
+                    // Create manual gateway
+                    const res = await axios.post('/adb/gateways', editingGateway);
+                    setAdbGateways([...adbGateways, res.data]);
+                }
             } else {
                 await axios.put(`/adb/gateways/${editingGateway.id}`, editingGateway);
                 setAdbGateways(adbGateways.map(g => g.id === editingGateway.id ? editingGateway : g));
             }
             setAdbDialogOpen(false);
             enqueueSnackbar(t('common.success'), { variant: 'success' });
+
+            // Reload gateways after a delay for Docker containers
+            if (gatewayCreationType === 'docker') {
+                setTimeout(() => {
+                    loadSettings();
+                }, 5000);
+            }
         } catch (error) {
             enqueueSnackbar(t('errors.saveFailed'), { variant: 'error' });
         }
@@ -270,6 +280,12 @@ const SettingsPage: React.FC = observer(() => {
             loadSettings();
         } catch (error) {
             enqueueSnackbar(t('errors.updateFailed'), { variant: 'error' });
+        }
+    };
+
+    const handleOpenVNC = (gateway: ADBGateway) => {
+        if (gateway.vnc_port) {
+            window.open(`http://localhost:${gateway.vnc_port}`, '_blank');
         }
     };
 
@@ -458,6 +474,8 @@ const SettingsPage: React.FC = observer(() => {
                 return 'error';
             case 'restarting':
                 return 'warning';
+            case 'creating':
+                return 'info';
             default:
                 return 'default';
         }
@@ -472,6 +490,50 @@ const SettingsPage: React.FC = observer(() => {
             }
         }
         return notification.config;
+    };
+
+    const handleSaveGeneralSettings = async () => {
+        try {
+            const updates = Object.entries(generalSettings).map(([key, value]) => ({
+                key,
+                value: value.toString(),
+            }));
+
+            await Promise.all(updates.map(update =>
+                axios.put(`/settings/${update.key}`, { value: update.value })
+            ));
+
+            enqueueSnackbar(t('settings.settingsSaved'), { variant: 'success' });
+        } catch (error) {
+            enqueueSnackbar(t('errors.saveFailed'), { variant: 'error' });
+        }
+    };
+
+    const changeLanguage = (lng: string) => {
+        i18n.changeLanguage(lng);
+    };
+
+    // ADB Gateway handlers
+    const handleAddGateway = () => {
+        setEditingGateway({
+            id: 0,
+            name: '',
+            host: '',
+            port: 5554,
+            service_code: 'yandex_aon',
+            is_active: true,
+            status: 'offline',
+            is_docker: false,
+        });
+        setGatewayCreationType('manual');
+        setDockerAPKFile(null);
+        setAdbDialogOpen(true);
+    };
+
+    const handleEditGateway = (gateway: ADBGateway) => {
+        setEditingGateway(gateway);
+        setGatewayCreationType(gateway.is_docker ? 'docker' : 'manual');
+        setAdbDialogOpen(true);
     };
 
     return (
@@ -567,12 +629,28 @@ const SettingsPage: React.FC = observer(() => {
                                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
                                                 <WifiTethering color={gateway.status === 'online' ? 'success' : 'error'} />
                                                 <Box>
-                                                    <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
-                                                        {gateway.name}
-                                                    </Typography>
+                                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                                        <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+                                                            {gateway.name}
+                                                        </Typography>
+                                                        {gateway.is_docker && (
+                                                            <Chip
+                                                                icon={<DockerIcon/>}
+                                                                label="Docker"
+                                                                size="small"
+                                                                color="primary"
+                                                                variant="outlined"
+                                                            />
+                                                        )}
+                                                    </Box>
                                                     <Typography variant="body2" color="text.secondary">
                                                         {gateway.host}:{gateway.port} • {t('settings.serviceCode')}: {gateway.service_code}
                                                     </Typography>
+                                                    {gateway.is_docker && gateway.vnc_port && (
+                                                        <Typography variant="caption" color="text.secondary">
+                                                            VNC Port: {gateway.vnc_port} • ADB Ports: {gateway.adb_port1}, {gateway.adb_port2}
+                                                        </Typography>
+                                                    )}
                                                 </Box>
                                                 <Chip
                                                     label={t(`settings.${gateway.status}`)}
@@ -581,6 +659,13 @@ const SettingsPage: React.FC = observer(() => {
                                                 />
                                             </Box>
                                             <Box>
+                                                {gateway.is_docker && gateway.vnc_port && gateway.status === 'online' && (
+                                                    <Tooltip title="Open VNC">
+                                                        <IconButton size="small" onClick={() => handleOpenVNC(gateway)}>
+                                                            <OpenInNew />
+                                                        </IconButton>
+                                                    </Tooltip>
+                                                )}
                                                 <Tooltip title={t('common.refresh')}>
                                                     <IconButton size="small" onClick={() => handleUpdateGatewayStatus(gateway.id)}>
                                                         <Refresh />
@@ -745,58 +830,134 @@ const SettingsPage: React.FC = observer(() => {
             <Dialog open={adbDialogOpen} onClose={() => setAdbDialogOpen(false)} maxWidth="sm" fullWidth>
                 <DialogTitle>{editingGateway?.id === 0 ? t('settings.addGateway') : t('settings.editGateway')}</DialogTitle>
                 <DialogContent>
-                    <Grid container spacing={2} sx={{ mt: 1 }}>
-                        <Grid item xs={12}>
-                            <TextField
-                                fullWidth
-                                label={t('settings.gatewayName')}
-                                value={editingGateway?.name || ''}
-                                onChange={(e) => setEditingGateway(editingGateway ? { ...editingGateway, name: e.target.value } : null)}
-                            />
-                        </Grid>
-                        <Grid item xs={12} md={8}>
-                            <TextField
-                                fullWidth
-                                label={t('settings.host')}
-                                value={editingGateway?.host || ''}
-                                onChange={(e) => setEditingGateway(editingGateway ? { ...editingGateway, host: e.target.value } : null)}
-                            />
-                        </Grid>
-                        <Grid item xs={12} md={4}>
-                            <TextField
-                                fullWidth
-                                label={t('settings.port')}
-                                type="number"
-                                value={editingGateway?.port || 5554}
-                                onChange={(e) => setEditingGateway(editingGateway ? { ...editingGateway, port: parseInt(e.target.value) } : null)}
-                            />
-                        </Grid>
-                        <Grid item xs={12}>
-                            <FormControl fullWidth>
-                                <InputLabel>{t('settings.serviceCode')}</InputLabel>
-                                <Select
-                                    value={editingGateway?.service_code || 'yandex_aon'}
-                                    label={t('settings.serviceCode')}
-                                    onChange={(e) => setEditingGateway(editingGateway ? { ...editingGateway, service_code: e.target.value } : null)}
+                    <Box sx={{ mt: 2 }}>
+                        {editingGateway?.id === 0 && (
+                            <>
+                                <Typography variant="subtitle2" sx={{ mb: 2 }}>Gateway Type</Typography>
+                                <RadioGroup
+                                    value={gatewayCreationType}
+                                    onChange={(e) => setGatewayCreationType(e.target.value as 'manual' | 'docker')}
+                                    sx={{ mb: 3 }}
                                 >
-                                    <MenuItem value="yandex_aon">Yandex АОН</MenuItem>
-                                    <MenuItem value="kaspersky">Kaspersky Who Calls</MenuItem>
-                                    <MenuItem value="getcontact">GetContact</MenuItem>
-                                </Select>
-                            </FormControl>
-                        </Grid>
-                        <Grid item xs={12}>
-                            <FormControlLabel
-                                control={
-                                    <Switch
-                                        checked={editingGateway?.is_active || false}
-                                        onChange={(e) => setEditingGateway(editingGateway ? { ...editingGateway, is_active: e.target.checked } : null)}
+                                    <FormControlLabel
+                                        value="manual"
+                                        control={<Radio />}
+                                        label={
+                                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                                <Computer />
+                                                <Box>
+                                                    <Typography variant="body1">Manual Configuration</Typography>
+                                                    <Typography variant="caption" color="text.secondary">
+                                                        Connect to existing Android emulator
+                                                    </Typography>
+                                                </Box>
+                                            </Box>
+                                        }
                                     />
-                                }
-                                label={t('common.active')}
-                            />
+                                    <FormControlLabel
+                                        value="docker"
+                                        control={<Radio />}
+                                        label={
+                                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                                <DockerIcon/>
+                                                <Box>
+                                                    <Typography variant="body1">Docker Container</Typography>
+                                                    <Typography variant="caption" color="text.secondary">
+                                                        Create new Android emulator in Docker
+                                                    </Typography>
+                                                </Box>
+                                            </Box>
+                                        }
+                                    />
+                                </RadioGroup>
+                                <Divider sx={{ mb: 3 }} />
+                            </>
+                        )}
+
+                        <Grid container spacing={2}>
+                            <Grid item xs={12}>
+                                <TextField
+                                    fullWidth
+                                    label={t('settings.gatewayName')}
+                                    value={editingGateway?.name || ''}
+                                    onChange={(e) => setEditingGateway(editingGateway ? { ...editingGateway, name: e.target.value } : null)}
+                                />
+                            </Grid>
+
+                            {(gatewayCreationType === 'manual' || editingGateway?.id !== 0) && !editingGateway?.is_docker && (
+                                <>
+                                    <Grid item xs={12} md={8}>
+                                        <TextField
+                                            fullWidth
+                                            label={t('settings.host')}
+                                            value={editingGateway?.host || ''}
+                                            onChange={(e) => setEditingGateway(editingGateway ? { ...editingGateway, host: e.target.value } : null)}
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} md={4}>
+                                        <TextField
+                                            fullWidth
+                                            label={t('settings.port')}
+                                            type="number"
+                                            value={editingGateway?.port || 5554}
+                                            onChange={(e) => setEditingGateway(editingGateway ? { ...editingGateway, port: parseInt(e.target.value) } : null)}
+                                        />
+                                    </Grid>
+                                </>
+                            )}
+
+                            <Grid item xs={12}>
+                                <FormControl fullWidth>
+                                    <InputLabel>{t('settings.serviceCode')}</InputLabel>
+                                    <Select
+                                        value={editingGateway?.service_code || 'yandex_aon'}
+                                        label={t('settings.serviceCode')}
+                                        onChange={(e) => setEditingGateway(editingGateway ? { ...editingGateway, service_code: e.target.value } : null)}
+                                    >
+                                        <MenuItem value="yandex_aon">Yandex АОН</MenuItem>
+                                        <MenuItem value="kaspersky">Kaspersky Who Calls</MenuItem>
+                                        <MenuItem value="getcontact">GetContact</MenuItem>
+                                    </Select>
+                                </FormControl>
+                            </Grid>
+
+                            {gatewayCreationType === 'docker' && editingGateway?.id === 0 && (
+                                <Grid item xs={12}>
+                                    <Alert severity="info" sx={{ mb: 2 }}>
+                                        Docker container will be created with Android emulator. You can optionally upload an APK file to install automatically.
+                                    </Alert>
+                                    <Button
+                                        variant="outlined"
+                                        component="label"
+                                        fullWidth
+                                        startIcon={<CloudUpload />}
+                                    >
+                                        {dockerAPKFile ? dockerAPKFile.name : 'Upload APK (Optional)'}
+                                        <input
+                                            type="file"
+                                            hidden
+                                            accept=".apk"
+                                            onChange={(e) => setDockerAPKFile(e.target.files?.[0] || null)}
+                                        />
+                                    </Button>
+                                </Grid>
+                            )}
+
+                            {editingGateway?.id !== 0 && !editingGateway?.is_docker && (
+                                <Grid item xs={12}>
+                                    <FormControlLabel
+                                        control={
+                                            <Switch
+                                                checked={editingGateway?.is_active || false}
+                                                onChange={(e) => setEditingGateway(editingGateway ? { ...editingGateway, is_active: e.target.checked } : null)}
+                                            />
+                                        }
+                                        label={t('common.active')}
+                                    />
+                                </Grid>
+                            )}
                         </Grid>
-                    </Grid>
+                    </Box>
                 </DialogContent>
                 <DialogActions>
                     <Button onClick={() => setAdbDialogOpen(false)}>{t('common.cancel')}</Button>
