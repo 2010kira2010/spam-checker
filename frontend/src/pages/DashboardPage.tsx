@@ -38,7 +38,6 @@ import {
     Cell,
 } from 'recharts';
 import { format } from 'date-fns';
-import { phoneStore } from '../stores/PhoneStore';
 import { useSnackbar } from 'notistack';
 import axios from 'axios';
 
@@ -110,22 +109,29 @@ const DashboardPage: React.FC = observer(() => {
         setIsLoading(true);
         try {
             // Load multiple data sources in parallel
-            const [statsResponse, phoneStatsResponse, timeSeriesResponse, serviceStatsResponse, recentSpamResponse] = await Promise.all([
+            const [overviewResponse, dashboardResponse, timeSeriesResponse, serviceStatsResponse, recentSpamResponse] = await Promise.all([
                 axios.get('/statistics/overview'),
-                axios.get('/phones/stats'),
+                axios.get('/statistics/dashboard').catch(() => ({ data: {} })), // Fallback if endpoint doesn't exist
                 axios.get('/statistics/timeseries?days=7'),
                 axios.get('/statistics/services'),
                 axios.get('/statistics/recent-spam?limit=5'),
             ]);
 
-            setOverviewStats(statsResponse.data);
-            setPhoneStats(phoneStatsResponse.data);
-            setTimeSeriesData(timeSeriesResponse.data);
-            setServiceStats(serviceStatsResponse.data);
-            setRecentSpamDetections(recentSpamResponse.data);
+            setOverviewStats(overviewResponse.data);
 
-            // Also fetch phone store stats
-            await phoneStore.fetchStats();
+            // Merge dashboard stats with phone stats
+            const dashboardData = dashboardResponse.data || {};
+            setPhoneStats({
+                total_phones: dashboardData.total_phones || overviewResponse.data.total_phones || 0,
+                active_phones: dashboardData.active_phones || overviewResponse.data.active_phones || 0,
+                spam_phones: dashboardData.spam_phones || 0,
+                clean_phones: dashboardData.clean_phones || 0,
+            });
+
+            // Ensure arrays
+            setTimeSeriesData(Array.isArray(timeSeriesResponse.data) ? timeSeriesResponse.data : []);
+            setServiceStats(Array.isArray(serviceStatsResponse.data) ? serviceStatsResponse.data : []);
+            setRecentSpamDetections(Array.isArray(recentSpamResponse.data) ? recentSpamResponse.data : []);
 
             setLastCheckTime(new Date());
         } catch (error) {

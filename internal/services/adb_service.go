@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"spam-checker/internal/config"
 	"spam-checker/internal/models"
+	"spam-checker/internal/utils"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +21,6 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
-	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
 
@@ -98,7 +98,7 @@ func NewADBServiceWithConfig(db *gorm.DB, cfg *config.Config) *ADBService {
 		client.WithAPIVersionNegotiation(),
 	)
 	if err != nil {
-		logrus.Errorf("Failed to create Docker client: %v", err)
+		utils.Log.Errorf("Failed to create Docker client: %v", err)
 	}
 
 	// Initialize port manager and load used ports from existing gateways
@@ -146,9 +146,15 @@ func (s *ADBService) CreateDockerGateway(gateway *models.ADBGateway, apkData []b
 		return fmt.Errorf("Docker client is not initialized")
 	}
 
-	// Allocate ports
+	// Save gateway first to get ID
+	if err := s.db.Create(gateway).Error; err != nil {
+		return fmt.Errorf("failed to create gateway: %w", err)
+	}
+
+	// Allocate ports using the new gateway ID
 	vncPort, adbPort1, adbPort2, err := s.portManager.AllocatePorts(gateway.ID)
 	if err != nil {
+		s.db.Delete(gateway)
 		return fmt.Errorf("failed to allocate ports: %w", err)
 	}
 
@@ -159,10 +165,11 @@ func (s *ADBService) CreateDockerGateway(gateway *models.ADBGateway, apkData []b
 	gateway.Port = adbPort1
 	gateway.IsDocker = true
 
-	// Save gateway first to get ID
-	if err := s.db.Create(gateway).Error; err != nil {
+	// Update gateway with port information
+	if err := s.db.Save(gateway).Error; err != nil {
 		s.portManager.ReleasePorts(vncPort, adbPort1, adbPort2)
-		return fmt.Errorf("failed to create gateway: %w", err)
+		s.db.Delete(gateway)
+		return fmt.Errorf("failed to update gateway: %w", err)
 	}
 
 	// Create container
@@ -240,42 +247,157 @@ func (s *ADBService) CreateDockerGateway(gateway *models.ADBGateway, apkData []b
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 
-	logrus.Infof("Created Docker container %s for gateway %s", containerName, gateway.Name)
+	utils.Log.Infof("Created Docker container %s for gateway %s", containerName, gateway.Name)
 
 	// Wait for container to be ready
-	go func() {
-		logrus.Info("Waiting for Android emulator to be ready...")
-		time.Sleep(60 * time.Second) // Give emulator time to boot
+	go func(gwID uint) {
+		utils.Log.Infof("Starting setup process for gateway ID: %d", gwID)
+
+		// Initial wait for container to start
+		time.Sleep(30 * time.Second)
+
+		// Update gateway status first
+		if err := s.UpdateGatewayStatus(gwID); err != nil {
+			utils.Log.Errorf("Failed to update gateway status for ID %d: %v", gwID, err)
+			return
+		}
+
+		// For budtmo/docker-android emulator, we might not need to wait for full Android boot
+		// if we're just using ADB commands. Let's check if ADB is available
+		gateway, err := s.GetGatewayByID(gwID)
+		if err != nil {
+			utils.Log.Errorf("Failed to get gateway %d: %v", gwID, err)
+			return
+		}
+
+		containerName := s.getContainerName(gateway)
+
+		// Quick check if ADB is available
+		output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
+		if err == nil && strings.Contains(output, "device") {
+			utils.Log.Info("ADB is available, proceeding with setup")
+		} else {
+			// Wait for emulator to be fully ready
+			if err := s.waitForEmulatorReady(gwID); err != nil {
+				utils.Log.Errorf("Failed to wait for emulator for gateway ID %d: %v", gwID, err)
+				// Don't return here, try to continue anyway
+			}
+		}
 
 		// Configure Android system
-		if err := s.configureAndroidSystem(gateway.ID); err != nil {
-			logrus.Errorf("Failed to configure Android system: %v", err)
+		if err := s.configureAndroidSystem(gwID); err != nil {
+			utils.Log.Errorf("Failed to configure Android system for gateway ID %d: %v", gwID, err)
+			// Don't return, continue with APK installation
 		}
 
 		// Install APK if provided
 		if len(apkData) > 0 {
-			logrus.Info("Installing APK...")
-			if err := s.installAPKFromData(gateway.ID, apkData); err != nil {
-				logrus.Errorf("Failed to install APK: %v", err)
+			utils.Log.Infof("Installing APK for gateway ID: %d", gwID)
+			if err := s.installAPKFromData(gwID, apkData); err != nil {
+				utils.Log.Errorf("Failed to install APK for gateway ID %d: %v", gwID, err)
 			}
 		}
 
-		// Update gateway status
-		s.UpdateGatewayStatus(gateway.ID)
-	}()
+		// Final status update
+		s.UpdateGatewayStatus(gwID)
+		utils.Log.Infof("Gateway ID %d setup completed", gwID)
+	}(gateway.ID)
 
 	return nil
 }
 
+// waitForEmulatorReady waits for the Android emulator to be fully ready
+func (s *ADBService) waitForEmulatorReady(gatewayID uint) error {
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return err
+	}
+
+	containerName := s.getContainerName(gateway)
+	maxAttempts := 120 // 10 minutes total - increased timeout
+
+	utils.Log.Infof("Waiting for emulator to be ready in container: %s", containerName)
+
+	for i := 0; i < maxAttempts; i++ {
+		// First check if container is running
+		ctx := context.Background()
+		containerInfo, err := s.dockerClient.ContainerInspect(ctx, gateway.ContainerID)
+		if err != nil {
+			utils.Log.Errorf("Failed to inspect container: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		if !containerInfo.State.Running {
+			utils.Log.Warnf("Container is not running, waiting...")
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Check if ADB is responding
+		output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
+		if err != nil {
+			utils.Log.Debugf("ADB not ready yet (attempt %d/%d): %v", i+1, maxAttempts, err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		utils.Log.Debugf("ADB devices output: %s", strings.ReplaceAll(output, "\n", " "))
+
+		// Check if we have an emulator device
+		if strings.Contains(output, "emulator") || strings.Contains(output, "device") {
+			// Sometimes the emulator doesn't show as "emulator" but as a generic device
+			// Check if boot is completed
+			bootOutput, err := s.executeInContainer(containerName, []string{"adb", "shell", "getprop", "sys.boot_completed"})
+			if err != nil {
+				utils.Log.Debugf("Failed to check boot_completed (attempt %d/%d): %v", i+1, maxAttempts, err)
+			} else {
+				utils.Log.Debugf("boot_completed: %s", strings.TrimSpace(bootOutput))
+				if strings.TrimSpace(bootOutput) == "1" {
+					// Additional check for package manager
+					pmOutput, err := s.executeInContainer(containerName, []string{"adb", "shell", "pm", "list", "packages", "-3"})
+					if err != nil {
+						utils.Log.Debugf("Package manager not ready (attempt %d/%d): %v", i+1, maxAttempts, err)
+					} else if pmOutput != "" {
+						utils.Log.Info("Android emulator is ready!")
+						return nil
+					} else {
+						// Even if no third-party packages, check for system packages
+						pmOutput, err = s.executeInContainer(containerName, []string{"adb", "shell", "pm", "list", "packages", "android"})
+						if err == nil && strings.Contains(pmOutput, "package:") {
+							utils.Log.Info("Android emulator is ready (system packages found)!")
+							return nil
+						}
+					}
+				}
+			}
+		} else {
+			utils.Log.Debugf("No device found in ADB output (attempt %d/%d)", i+1, maxAttempts)
+		}
+
+		utils.Log.Infof("Waiting for emulator to be ready... attempt %d/%d", i+1, maxAttempts)
+		time.Sleep(5 * time.Second)
+	}
+
+	return fmt.Errorf("emulator failed to become ready after %d seconds", maxAttempts*5)
+}
+
 // configureAndroidSystem configures Android system settings
 func (s *ADBService) configureAndroidSystem(gatewayID uint) error {
-	// Wait for device to be ready
-	for i := 0; i < 30; i++ {
-		output, err := s.ExecuteCommand(gatewayID, "getprop sys.boot_completed")
-		if err == nil && strings.TrimSpace(output) == "1" {
-			break
-		}
-		time.Sleep(5 * time.Second)
+	utils.Log.Infof("Configuring Android system for gateway ID: %d", gatewayID)
+
+	gateway, err := s.GetGatewayByID(gatewayID)
+	if err != nil {
+		return fmt.Errorf("failed to get gateway: %w", err)
+	}
+
+	containerName := s.getContainerName(gateway)
+
+	// Check if ADB is available before trying to configure
+	output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
+	if err != nil || !strings.Contains(output, "device") {
+		utils.Log.Warnf("ADB not ready, skipping Android configuration")
+		return fmt.Errorf("ADB not ready")
 	}
 
 	// Set language to Russian
@@ -289,21 +411,30 @@ func (s *ADBService) configureAndroidSystem(gatewayID uint) error {
 		"am broadcast -a android.intent.action.LOCALE_CHANGED",
 	}
 
+	successCount := 0
 	for _, cmd := range commands {
-		if _, err := s.ExecuteCommand(gatewayID, cmd); err != nil {
-			logrus.Warnf("Failed to execute command '%s': %v", cmd, err)
+		fullCmd := append([]string{"adb", "shell"}, strings.Fields(cmd)...)
+		if _, err := s.executeInContainer(containerName, fullCmd); err != nil {
+			utils.Log.Warnf("Failed to execute command '%s': %v", cmd, err)
+		} else {
+			successCount++
 		}
 	}
 
-	// Restart system UI to apply changes
-	s.ExecuteCommand(gatewayID, "am restart")
+	if successCount > 0 {
+		// Some commands succeeded, try to restart system UI
+		s.executeInContainer(containerName, []string{"adb", "shell", "am", "restart"})
+		utils.Log.Infof("Android system configured with %d/%d successful commands", successCount, len(commands))
+		return nil
+	}
 
-	logrus.Info("Android system configured successfully")
-	return nil
+	return fmt.Errorf("all configuration commands failed")
 }
 
 // installAPKFromData installs APK from byte data
 func (s *ADBService) installAPKFromData(gatewayID uint, apkData []byte) error {
+	utils.Log.Infof("Installing APK for gateway ID: %d", gatewayID)
+
 	// Save APK to temporary file
 	tempFile, err := os.CreateTemp("", "app-*.apk")
 	if err != nil {
@@ -330,7 +461,7 @@ func (s *ADBService) DeleteDockerGateway(gateway *models.ADBGateway) error {
 
 	// Stop container
 	if err := s.dockerClient.ContainerStop(ctx, gateway.ContainerID, container.StopOptions{}); err != nil {
-		logrus.Warnf("Failed to stop container: %v", err)
+		utils.Log.Warnf("Failed to stop container: %v", err)
 	}
 
 	// Remove container
@@ -338,13 +469,13 @@ func (s *ADBService) DeleteDockerGateway(gateway *models.ADBGateway) error {
 		Force:         true,
 		RemoveVolumes: true,
 	}); err != nil {
-		logrus.Warnf("Failed to remove container: %v", err)
+		utils.Log.Warnf("Failed to remove container: %v", err)
 	}
 
 	// Release ports
 	s.portManager.ReleasePorts(gateway.VNCPort, gateway.ADBPort1, gateway.ADBPort2)
 
-	logrus.Infof("Deleted Docker container for gateway %s", gateway.Name)
+	utils.Log.Infof("Deleted Docker container for gateway %s", gateway.Name)
 	return nil
 }
 
@@ -397,7 +528,7 @@ func (s *ADBService) DeleteGateway(id uint) error {
 	// Delete Docker container if it's a Docker gateway
 	if gateway.IsDocker {
 		if err := s.DeleteDockerGateway(gateway); err != nil {
-			logrus.Errorf("Failed to delete Docker container: %v", err)
+			utils.Log.Errorf("Failed to delete Docker container: %v", err)
 		}
 	}
 
@@ -419,7 +550,7 @@ func (s *ADBService) UpdateGatewayStatus(gatewayID uint) error {
 
 	// Check if Docker client is available
 	if s.dockerClient == nil {
-		logrus.Error("Docker client is not initialized")
+		utils.Log.Error("Docker client is not initialized")
 		return fmt.Errorf("Docker client is not initialized")
 	}
 
@@ -432,7 +563,7 @@ func (s *ADBService) UpdateGatewayStatus(gatewayID uint) error {
 		if err == nil && containerInfo.State.Running {
 			// Test ADB connection
 			output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
-			if err == nil && strings.Contains(output, "emulator") {
+			if err == nil && strings.Contains(output, "emulator") && strings.Contains(output, "device") {
 				status = "online"
 			}
 		}
@@ -440,7 +571,7 @@ func (s *ADBService) UpdateGatewayStatus(gatewayID uint) error {
 		// Check by name for manual gateways
 		containers, err := s.dockerClient.ContainerList(ctx, container.ListOptions{})
 		if err != nil {
-			logrus.Errorf("Failed to list containers: %v", err)
+			utils.Log.Errorf("Failed to list containers: %v", err)
 			return err
 		}
 
@@ -451,7 +582,7 @@ func (s *ADBService) UpdateGatewayStatus(gatewayID uint) error {
 					if cont.State == "running" {
 						// Test ADB connection inside container
 						output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
-						if err == nil && strings.Contains(output, "emulator") {
+						if err == nil && strings.Contains(output, "emulator") && strings.Contains(output, "device") {
 							status = "online"
 						}
 					}
@@ -473,7 +604,7 @@ func (s *ADBService) UpdateGatewayStatus(gatewayID uint) error {
 		return fmt.Errorf("failed to update gateway status: %w", err)
 	}
 
-	logrus.Infof("Gateway %s (%s) status updated: %s", gateway.Name, containerName, status)
+	utils.Log.Infof("Gateway %s (%s) status updated: %s", gateway.Name, containerName, status)
 
 	return nil
 }
@@ -487,7 +618,7 @@ func (s *ADBService) UpdateAllGatewayStatuses() error {
 
 	for _, gateway := range gateways {
 		if err := s.UpdateGatewayStatus(gateway.ID); err != nil {
-			logrus.Errorf("Failed to update gateway %s status: %v", gateway.Name, err)
+			utils.Log.Errorf("Failed to update gateway %s status: %v", gateway.Name, err)
 		}
 	}
 
@@ -501,11 +632,13 @@ func (s *ADBService) ExecuteCommand(gatewayID uint, command string) (string, err
 		return "", err
 	}
 
-	if gateway.Status != "online" {
-		return "", fmt.Errorf("gateway %s is not online", gateway.Name)
-	}
-
 	containerName := s.getContainerName(gateway)
+
+	// Check if container and ADB are ready directly instead of relying on DB status
+	output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
+	if err != nil || !strings.Contains(output, "device") {
+		return "", fmt.Errorf("ADB is not ready on gateway %s", gateway.Name)
+	}
 
 	// Execute command inside container
 	fullCommand := []string{"adb", "shell"}
@@ -613,6 +746,7 @@ func (s *ADBService) RestartDevice(gatewayID uint) error {
 	if gateway.IsDocker {
 		go func() {
 			time.Sleep(60 * time.Second)
+			s.waitForEmulatorReady(gatewayID)
 			s.configureAndroidSystem(gatewayID)
 			s.UpdateGatewayStatus(gatewayID)
 		}()
@@ -628,11 +762,13 @@ func (s *ADBService) InstallAPK(gatewayID uint, apkPath string) error {
 		return err
 	}
 
-	if gateway.Status != "online" {
-		return fmt.Errorf("gateway %s is not online", gateway.Name)
-	}
-
 	containerName := s.getContainerName(gateway)
+
+	// Check if ADB is ready
+	output, err := s.executeInContainer(containerName, []string{"adb", "devices"})
+	if err != nil || !strings.Contains(output, "device") {
+		return fmt.Errorf("ADB is not ready on gateway %s", gateway.Name)
+	}
 
 	// Read APK file
 	apkFile, err := os.Open(apkPath)
@@ -678,7 +814,7 @@ func (s *ADBService) InstallAPK(gatewayID uint, apkPath string) error {
 	}
 
 	// Install APK
-	output, err := s.executeInContainer(containerName, []string{"adb", "install", "-r", "/tmp/app.apk"})
+	output, err = s.executeInContainer(containerName, []string{"adb", "install", "-r", "/tmp/app.apk"})
 	if err != nil {
 		return fmt.Errorf("failed to install APK: %w, output: %s", err, output)
 	}
@@ -690,7 +826,7 @@ func (s *ADBService) InstallAPK(gatewayID uint, apkPath string) error {
 	// Clean up
 	s.executeInContainer(containerName, []string{"rm", "/tmp/app.apk"})
 
-	logrus.Infof("APK installed successfully on gateway %s", gateway.Name)
+	utils.Log.Infof("APK installed successfully on gateway %s", gateway.Name)
 
 	return nil
 }
@@ -834,7 +970,7 @@ func (s *ADBService) SimulateIncomingCall(gatewayID uint, phoneNumber string) er
 		return fmt.Errorf("failed to simulate call: %w, output: %s", err, output)
 	}
 
-	logrus.Infof("Simulated incoming call from %s on gateway %s", normalizedNumber, gateway.Name)
+	utils.Log.Infof("Simulated incoming call from %s on gateway %s", normalizedNumber, gateway.Name)
 
 	return nil
 }
@@ -852,26 +988,26 @@ func (s *ADBService) EndCall(gatewayID uint, phoneNumber string) error {
 	// Method 1: Try to cancel via GSM emulator (without phone number)
 	output, err := s.executeInContainer(containerName, []string{"adb", "emu", "gsm", "cancel", phoneNumber})
 	if err != nil {
-		logrus.Warnf("Failed to cancel call via GSM emulator: %v", err)
+		utils.Log.Warnf("Failed to cancel call via GSM emulator: %v", err)
 
 		// Method 2: Use key event as fallback
 		err = s.SendKeyEvent(gatewayID, "KEYCODE_ENDCALL")
 		if err != nil {
-			logrus.Warnf("Failed to end call via KEYCODE_ENDCALL: %v", err)
+			utils.Log.Warnf("Failed to end call via KEYCODE_ENDCALL: %v", err)
 
 			// Method 3: Try HOME key to dismiss call screen
 			err = s.SendKeyEvent(gatewayID, "KEYCODE_HOME")
 			if err != nil {
 				return fmt.Errorf("failed to end call using all methods")
 			}
-			logrus.Info("Dismissed call screen using HOME key")
+			utils.Log.Info("Dismissed call screen using HOME key")
 			return nil
 		}
-		logrus.Info("Ended call using KEYCODE_ENDCALL")
+		utils.Log.Info("Ended call using KEYCODE_ENDCALL")
 		return nil
 	}
 
-	logrus.Infof("Ended call on gateway %s: %s", gateway.Name, output)
+	utils.Log.Infof("Ended call on gateway %s: %s", gateway.Name, output)
 	return nil
 }
 
@@ -907,7 +1043,7 @@ func (s *ADBService) ClearAppData(gatewayID uint, serviceCode string) error {
 		return fmt.Errorf("failed to clear app data: %s", output)
 	}
 
-	logrus.Infof("App data cleared for %s on gateway %d", appPackage, gatewayID)
+	utils.Log.Infof("App data cleared for %s on gateway %d", appPackage, gatewayID)
 
 	return nil
 }

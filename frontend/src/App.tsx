@@ -19,6 +19,7 @@ import LoadingScreen from './components/LoadingScreen';
 
 // Pages
 import LoginPage from './pages/LoginPage';
+import RegisterPage from './pages/RegisterPage';
 import DashboardPage from './pages/DashboardPage';
 import PhonesPage from './pages/PhonesPage';
 import ChecksPage from './pages/ChecksPage';
@@ -184,6 +185,7 @@ const App: React.FC = observer(() => {
                         <Routes>
                             {/* Public routes */}
                             <Route path="/login" element={authStore.isAuthenticated ? <Navigate to="/" /> : <LoginPage />} />
+                            <Route path="/register" element={authStore.isAuthenticated ? <Navigate to="/" /> : <RegisterPage />} />
 
                             {/* Private routes */}
                             <Route

@@ -538,22 +538,6 @@ const SettingsPage: React.FC = observer(() => {
 
     return (
         <Box>
-            <Box sx={{ mb: 3, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <Typography variant="h4" sx={{ fontWeight: 600 }}>
-                    {t('settings.title')}
-                </Typography>
-                <FormControl size="small">
-                    <Select
-                        value={i18n.language}
-                        onChange={(e) => changeLanguage(e.target.value)}
-                        startAdornment={<Language sx={{ mr: 1, color: 'text.secondary' }} />}
-                    >
-                        <MenuItem value="en">English</MenuItem>
-                        <MenuItem value="ru">Русский</MenuItem>
-                    </Select>
-                </FormControl>
-            </Box>
-
             {isLoading ? (
                 <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}>
                     <CircularProgress />
