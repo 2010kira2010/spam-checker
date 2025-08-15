@@ -43,6 +43,7 @@ func Migrate(db *gorm.DB) error {
 		&models.SpamService{},
 		&models.CheckResult{},
 		&models.ADBGateway{},
+		&models.APIService{},
 		&models.SystemSettings{},
 		&models.Notification{},
 		&models.CheckSchedule{},

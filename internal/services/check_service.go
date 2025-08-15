@@ -23,6 +23,7 @@ type CheckService struct {
 	db             *gorm.DB
 	cfg            *config.Config
 	adbService     *ADBService
+	apiService     *APICheckService
 	gatewayLocks   map[uint]*sync.Mutex
 	gatewayLocksMu sync.RWMutex
 }
@@ -36,6 +37,15 @@ type ConcurrentCheckResult struct {
 	Result  *models.CheckResult
 }
 
+// APICheckResult for concurrent API processing
+type APICheckResult struct {
+	PhoneID    uint
+	APIService *models.APIService
+	Service    *models.SpamService
+	Error      error
+	Result     *models.CheckResult
+}
+
 // GetDB returns database instance for handlers
 func (s *CheckService) GetDB() *gorm.DB {
 	return s.db
@@ -46,6 +56,7 @@ func NewCheckService(db *gorm.DB, cfg *config.Config) *CheckService {
 		db:           db,
 		cfg:          cfg,
 		adbService:   NewADBServiceWithConfig(db, cfg),
+		apiService:   NewAPICheckService(db),
 		gatewayLocks: make(map[uint]*sync.Mutex),
 	}
 }
@@ -97,6 +108,56 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 		return fmt.Errorf("phone not found: %w", err)
 	}
 
+	// Get check mode setting
+	checkMode := s.getCheckMode()
+
+	logrus.Infof("Starting check for phone %s with mode: %s", phone.Number, checkMode)
+
+	// Perform checks based on mode
+	switch checkMode {
+	case models.CheckModeADBOnly:
+		return s.checkViaADB(&phone)
+	case models.CheckModeAPIOnly:
+		return s.checkViaAPI(&phone)
+	case models.CheckModeBoth:
+		// Check both ADB and API concurrently
+		var wg sync.WaitGroup
+		var adbErr, apiErr error
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			adbErr = s.checkViaADB(&phone)
+		}()
+		go func() {
+			defer wg.Done()
+			apiErr = s.checkViaAPI(&phone)
+		}()
+
+		wg.Wait()
+
+		// Return error only if both failed
+		if adbErr != nil && apiErr != nil {
+			return fmt.Errorf("both ADB and API checks failed: ADB: %v, API: %v", adbErr, apiErr)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown check mode: %s", checkMode)
+	}
+}
+
+// getCheckMode gets the check mode from settings
+func (s *CheckService) getCheckMode() models.CheckMode {
+	var setting models.SystemSettings
+	if err := s.db.Where("key = ?", "check_mode").First(&setting).Error; err != nil {
+		// Default to ADB only if setting not found
+		return models.CheckModeADBOnly
+	}
+	return models.CheckMode(setting.Value)
+}
+
+// checkViaADB checks phone via ADB gateways
+func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 	// Get active gateways
 	gateways, err := s.adbService.GetActiveGateways()
 	if err != nil {
@@ -104,10 +165,10 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 	}
 
 	if len(gateways) == 0 {
-		return fmt.Errorf("no active gateways available")
+		return fmt.Errorf("no active ADB gateways available")
 	}
 
-	logrus.Infof("Starting concurrent check for phone %s across %d gateways", phone.Number, len(gateways))
+	logrus.Infof("Starting ADB check for phone %s across %d gateways", phone.Number, len(gateways))
 
 	// Create a channel for results
 	resultChan := make(chan ConcurrentCheckResult, len(gateways))
@@ -149,7 +210,7 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 				Service: &service,
 			}
 
-			if err := s.checkOnGateway(&phone, &gw); err != nil {
+			if err := s.checkOnGateway(phone, &gw); err != nil {
 				result.Error = err
 				logrus.Errorf("Failed to check phone %s on gateway %s: %v", phone.Number, gw.Name, err)
 			} else {
@@ -187,11 +248,94 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 		}
 	}
 
-	logrus.Infof("Concurrent check completed for phone %s: %d successful, %d failed, %d busy",
+	logrus.Infof("ADB check completed for phone %s: %d successful, %d failed, %d busy",
 		phone.Number, successCount, errorCount, busyCount)
 
 	if successCount == 0 && errorCount > 0 {
-		return fmt.Errorf("all checks failed for phone %s", phone.Number)
+		return fmt.Errorf("all ADB checks failed for phone %s", phone.Number)
+	}
+
+	return nil
+}
+
+// checkViaAPI checks phone via API services
+func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
+	// Get active API services
+	apiServices, err := s.apiService.GetActiveAPIServices()
+	if err != nil {
+		return fmt.Errorf("failed to get active API services: %w", err)
+	}
+
+	if len(apiServices) == 0 {
+		return fmt.Errorf("no active API services available")
+	}
+
+	logrus.Infof("Starting API check for phone %s across %d services", phone.Number, len(apiServices))
+
+	// Create a channel for results
+	resultChan := make(chan APICheckResult, len(apiServices))
+	var wg sync.WaitGroup
+
+	// Check on each API service concurrently
+	for _, apiService := range apiServices {
+		wg.Add(1)
+		go func(api models.APIService) {
+			defer wg.Done()
+
+			// Get service info
+			var service models.SpamService
+			if err := s.db.Where("code = ?", api.ServiceCode).First(&service).Error; err != nil {
+				resultChan <- APICheckResult{
+					PhoneID:    phone.ID,
+					APIService: &api,
+					Error:      fmt.Errorf("service not found: %w", err),
+				}
+				return
+			}
+
+			// Perform check
+			result := APICheckResult{
+				PhoneID:    phone.ID,
+				APIService: &api,
+				Service:    &service,
+			}
+
+			checkResult, err := s.apiService.CheckPhoneViaAPI(phone, &api)
+			if err != nil {
+				result.Error = err
+				logrus.Errorf("Failed to check phone %s via API %s: %v", phone.Number, api.Name, err)
+			} else {
+				result.Result = checkResult
+				// Update statistics
+				s.updateStatistics(phone.ID, service.ID, checkResult.IsSpam)
+			}
+
+			resultChan <- result
+		}(apiService)
+	}
+
+	// Close channel when all goroutines complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	successCount := 0
+	errorCount := 0
+	for result := range resultChan {
+		if result.Error != nil {
+			errorCount++
+		} else {
+			successCount++
+		}
+	}
+
+	logrus.Infof("API check completed for phone %s: %d successful, %d failed",
+		phone.Number, successCount, errorCount)
+
+	if successCount == 0 && errorCount > 0 {
+		return fmt.Errorf("all API checks failed for phone %s", phone.Number)
 	}
 
 	return nil
@@ -357,7 +501,7 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 		var recentResults []models.CheckResult
 		err = s.db.Where("phone_number_id = ?", existingPhone.ID).
 			Order("checked_at DESC").
-			Limit(3). // Get results for each service
+			Limit(10). // Get more results to cover all services
 			Preload("Service").
 			Find(&recentResults).Error
 
@@ -420,85 +564,133 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 
 // performRealtimeCheck performs actual realtime check for a phone
 func (s *CheckService) performRealtimeCheck(phone *models.PhoneNumber, highPriority bool) (map[string]interface{}, error) {
-	// Get active gateways
-	gateways, err := s.adbService.GetActiveGateways()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get active gateways: %w", err)
-	}
-
-	if len(gateways) == 0 {
-		return nil, fmt.Errorf("no active gateways available")
-	}
-
 	results := make(map[string]interface{})
 	results["phone_number"] = phone.Number
 	results["checked_at"] = time.Now()
 	results["cached"] = false
 
 	var serviceResults []map[string]interface{}
-	resultChan := make(chan map[string]interface{}, len(gateways))
 	var wg sync.WaitGroup
+	resultChan := make(chan map[string]interface{}, 20) // Increased buffer
 
-	// Check on each gateway concurrently
-	for _, gateway := range gateways {
-		wg.Add(1)
-		go func(gw models.ADBGateway) {
-			defer wg.Done()
+	checkMode := s.getCheckMode()
 
-			// For realtime checks, use shorter timeout
-			timeout := 10 * time.Second
-			if highPriority {
-				timeout = 5 * time.Second
-			}
+	// Check via ADB if enabled
+	if checkMode == models.CheckModeADBOnly || checkMode == models.CheckModeBoth {
+		// Get active gateways
+		gateways, err := s.adbService.GetActiveGateways()
+		if err != nil && checkMode == models.CheckModeADBOnly {
+			return nil, fmt.Errorf("failed to get active gateways: %w", err)
+		}
 
-			// Try to lock gateway with timeout
-			if !s.tryLockGateway(gw.ID, timeout) {
-				logrus.Warnf("Gateway %s is busy, skipping realtime check", gw.Name)
-				resultChan <- map[string]interface{}{
-					"service": gw.ServiceCode,
-					"error":   "Gateway is busy",
-					"busy":    true,
+		for _, gateway := range gateways {
+			wg.Add(1)
+			go func(gw models.ADBGateway) {
+				defer wg.Done()
+
+				// For realtime checks, use shorter timeout
+				timeout := 10 * time.Second
+				if highPriority {
+					timeout = 5 * time.Second
 				}
-				return
-			}
-			defer s.unlockGateway(gw.ID)
 
-			// Get service info
-			var service models.SpamService
-			if err := s.db.Where("code = ?", gw.ServiceCode).First(&service).Error; err != nil {
-				resultChan <- map[string]interface{}{
-					"service": "Unknown",
-					"error":   err.Error(),
+				// Try to lock gateway with timeout
+				if !s.tryLockGateway(gw.ID, timeout) {
+					logrus.Warnf("Gateway %s is busy, skipping realtime check", gw.Name)
+					resultChan <- map[string]interface{}{
+						"service": gw.ServiceCode,
+						"error":   "Gateway is busy",
+						"busy":    true,
+					}
+					return
 				}
-				return
-			}
+				defer s.unlockGateway(gw.ID)
 
-			// Perform check
-			if err := s.checkOnGateway(phone, &gw); err != nil {
-				resultChan <- map[string]interface{}{
-					"service": service.Name,
-					"error":   err.Error(),
+				// Get service info
+				var service models.SpamService
+				if err := s.db.Where("code = ?", gw.ServiceCode).First(&service).Error; err != nil {
+					resultChan <- map[string]interface{}{
+						"service": "Unknown",
+						"error":   err.Error(),
+					}
+					return
 				}
-				return
-			}
 
-			// Get result
-			var checkResult models.CheckResult
-			if err := s.db.Where("phone_number_id = ? AND service_id = ?", phone.ID, service.ID).
-				Order("checked_at DESC").First(&checkResult).Error; err == nil {
+				// Perform check
+				if err := s.checkOnGateway(phone, &gw); err != nil {
+					resultChan <- map[string]interface{}{
+						"service": service.Name,
+						"error":   err.Error(),
+					}
+					return
+				}
+
+				// Get result
+				var checkResult models.CheckResult
+				if err := s.db.Where("phone_number_id = ? AND service_id = ?", phone.ID, service.ID).
+					Order("checked_at DESC").First(&checkResult).Error; err == nil {
+					resultChan <- map[string]interface{}{
+						"service":        service.Name,
+						"is_spam":        checkResult.IsSpam,
+						"found_keywords": []string(checkResult.FoundKeywords),
+						"checked_at":     checkResult.CheckedAt,
+						"type":           "adb",
+					}
+				} else {
+					resultChan <- map[string]interface{}{
+						"service": service.Name,
+						"error":   "Result not found",
+					}
+				}
+			}(gateway)
+		}
+	}
+
+	// Check via API if enabled
+	if checkMode == models.CheckModeAPIOnly || checkMode == models.CheckModeBoth {
+		// Get active API services
+		apiServices, err := s.apiService.GetActiveAPIServices()
+		if err != nil && checkMode == models.CheckModeAPIOnly {
+			return nil, fmt.Errorf("failed to get active API services: %w", err)
+		}
+
+		for _, apiService := range apiServices {
+			wg.Add(1)
+			go func(api models.APIService) {
+				defer wg.Done()
+
+				// Get service info
+				var service models.SpamService
+				if err := s.db.Where("code = ?", api.ServiceCode).First(&service).Error; err != nil {
+					resultChan <- map[string]interface{}{
+						"service": "Unknown",
+						"error":   err.Error(),
+					}
+					return
+				}
+
+				// Perform API check
+				checkResult, err := s.apiService.CheckPhoneViaAPI(phone, &api)
+				if err != nil {
+					resultChan <- map[string]interface{}{
+						"service": service.Name,
+						"error":   err.Error(),
+					}
+					return
+				}
+
+				// Update statistics
+				s.updateStatistics(phone.ID, service.ID, checkResult.IsSpam)
+
 				resultChan <- map[string]interface{}{
 					"service":        service.Name,
 					"is_spam":        checkResult.IsSpam,
 					"found_keywords": []string(checkResult.FoundKeywords),
 					"checked_at":     checkResult.CheckedAt,
+					"type":           "api",
 				}
-			} else {
-				resultChan <- map[string]interface{}{
-					"service": service.Name,
-					"error":   "Result not found",
-				}
-			}
-		}(gateway)
+			}(apiService)
+		}
 	}
 
 	// Collect results
