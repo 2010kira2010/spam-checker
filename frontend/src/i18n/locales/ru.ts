@@ -48,6 +48,16 @@ export const ru = {
         welcomeBack: 'С возвращением',
         signInToContinue: 'Войдите, чтобы продолжить работу со SpamChecker',
     },
+    registration: {
+        dontHaveAccount: 'Нет учетной записи?',
+        register: 'Регистрация',
+        role: 'Роль',
+        subtitle: 'Подзаголовок',
+        title: 'Должность',
+        createAccount: 'Создать учётную запись',
+        selectRole: 'Выбрать роль',
+        alreadyHaveAccount: 'Уже есть учётная запись?',
+    },
     navigation: {
         dashboard: 'Панель управления',
         phones: 'Телефонные номера',

@@ -13,6 +13,13 @@ export interface LoginData {
     password: string;
 }
 
+export interface RegisterData {
+    username: string;
+    email: string;
+    password: string;
+    role: 'admin' | 'supervisor' | 'user';
+}
+
 export interface AuthTokens {
     access_token: string;
     refresh_token: string;
@@ -86,6 +93,41 @@ class AuthStore {
         }
     }
 
+    async register(data: RegisterData) {
+        this.isLoading = true;
+        this.error = null;
+
+        try {
+            // First, register the user
+            const response = await axios.post<{
+                message: string;
+                user: User;
+            }>('/auth/register', data);
+
+            runInAction(() => {
+                this.isLoading = false;
+            });
+
+            return true;
+        } catch (error: any) {
+            runInAction(() => {
+                let errorMessage = 'Registration failed';
+
+                if (error.response?.data?.error) {
+                    errorMessage = error.response.data.error;
+                } else if (error.response?.status === 400) {
+                    errorMessage = 'Invalid registration data. Please check your input.';
+                } else if (error.response?.status === 409) {
+                    errorMessage = 'User with this email or username already exists.';
+                }
+
+                this.error = errorMessage;
+                this.isLoading = false;
+            });
+            return false;
+        }
+    }
+
     async refreshToken() {
         const refreshToken = localStorage.getItem('refresh_token');
         if (!refreshToken) {
@@ -120,6 +162,7 @@ class AuthStore {
         localStorage.removeItem('access_token');
         localStorage.removeItem('refresh_token');
         localStorage.removeItem('user');
+        localStorage.removeItem('rememberMe');
         delete axios.defaults.headers.common['Authorization'];
 
         runInAction(() => {

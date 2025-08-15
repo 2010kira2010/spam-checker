@@ -48,6 +48,16 @@ export const en = {
         welcomeBack: 'Welcome Back',
         signInToContinue: 'Sign in to continue to SpamChecker',
     },
+    registration: {
+        dontHaveAccount: 'Dont have account?',
+        register: 'Register',
+        role: 'Role',
+        subtitle: 'Subtitle',
+        title: 'Title',
+        createAccount: 'Create account',
+        selectRole: 'Select role',
+        alreadyHaveAccount: 'Already have account?',
+    },
     navigation: {
         dashboard: 'Dashboard',
         phones: 'Phone Numbers',
