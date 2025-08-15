@@ -112,6 +112,7 @@ func seedInitialData(db *gorm.DB) error {
 		{Key: "screenshot_quality", Value: "80", Type: "int", Category: "ocr"},
 		{Key: "ocr_confidence_threshold", Value: "70", Type: "int", Category: "ocr"},
 		{Key: "notification_batch_size", Value: "50", Type: "int", Category: "notification"},
+		{Key: "check_mode", Value: "adb_only", Type: "string", Category: "general"},
 	}
 
 	for _, setting := range defaultSettings {

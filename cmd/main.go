@@ -71,6 +71,7 @@ func main() {
 	phoneService := services.NewPhoneService(db)
 	checkService := services.NewCheckService(db, cfg)
 	adbService := services.NewADBService(db, cfg)
+	apiCheckService := services.NewAPICheckService(db)
 	settingsService := services.NewSettingsService(db)
 	statisticsService := services.NewStatisticsService(db)
 	notificationService := services.NewNotificationService(db)
@@ -125,6 +126,9 @@ func main() {
 
 	// ADB Gateway routes
 	handlers.RegisterADBRoutes(protected, adbService, authMiddleware)
+
+	// API Gateway routes
+	handlers.RegisterAPIServiceRoutes(protected, apiCheckService, authMiddleware)
 
 	// Settings routes
 	handlers.RegisterSettingsRoutes(protected, settingsService, authMiddleware)

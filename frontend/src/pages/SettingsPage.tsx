@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from 'react';
 import { observer } from 'mobx-react-lite';
 import { useTranslation } from 'react-i18next';
@@ -57,6 +56,8 @@ import {
     Computer,
     CloudUpload,
     OpenInNew,
+    Api,
+    PlayArrow,
 } from '@mui/icons-material';
 import { useSnackbar } from 'notistack';
 import axios from 'axios';
@@ -67,6 +68,7 @@ interface GeneralSettings {
     notification_batch_size: number;
     screenshot_quality: number;
     ocr_confidence_threshold: number;
+    check_mode: string;
 }
 
 interface ADBGateway {
@@ -84,6 +86,18 @@ interface ADBGateway {
     vnc_port?: number;
     adb_port1?: number;
     adb_port2?: number;
+}
+
+interface APIService {
+    id: number;
+    name: string;
+    service_code: string;
+    api_url: string;
+    headers: string;
+    method: string;
+    request_body?: string;
+    timeout: number;
+    is_active: boolean;
 }
 
 interface SpamKeyword {
@@ -152,6 +166,7 @@ const SettingsPage: React.FC = observer(() => {
         notification_batch_size: 50,
         screenshot_quality: 80,
         ocr_confidence_threshold: 70,
+        check_mode: 'adb_only',
     });
 
     // ADB Gateways
@@ -160,6 +175,14 @@ const SettingsPage: React.FC = observer(() => {
     const [editingGateway, setEditingGateway] = useState<ADBGateway | null>(null);
     const [gatewayCreationType, setGatewayCreationType] = useState<'manual' | 'docker'>('manual');
     const [dockerAPKFile, setDockerAPKFile] = useState<File | null>(null);
+
+    // API Services
+    const [apiServices, setApiServices] = useState<APIService[]>([]);
+    const [apiDialogOpen, setApiDialogOpen] = useState(false);
+    const [editingApiService, setEditingApiService] = useState<APIService | null>(null);
+    const [testingApiService, setTestingApiService] = useState<number | null>(null);
+    const [testPhoneNumber, setTestPhoneNumber] = useState('');
+    const [testResults, setTestResults] = useState<any>(null);
 
     // Keywords
     const [keywords, setKeywords] = useState<SpamKeyword[]>([]);
@@ -184,9 +207,10 @@ const SettingsPage: React.FC = observer(() => {
         setIsLoading(true);
         try {
             // Load all settings
-            const [settingsRes, gatewaysRes, keywordsRes, schedulesRes, notificationsRes] = await Promise.all([
+            const [settingsRes, gatewaysRes, apisRes, keywordsRes, schedulesRes, notificationsRes] = await Promise.all([
                 axios.get('/settings'),
                 axios.get('/adb/gateways'),
+                axios.get('/api-services').catch(() => ({ data: [] })),
                 axios.get('/settings/keywords'),
                 axios.get('/settings/schedules'),
                 axios.get('/notifications'),
@@ -201,9 +225,13 @@ const SettingsPage: React.FC = observer(() => {
                     settings[setting.key] = setting.value;
                 }
             });
-            setGeneralSettings(settings as GeneralSettings);
+            setGeneralSettings({
+                ...generalSettings,
+                ...settings,
+            });
 
             setAdbGateways(gatewaysRes.data);
+            setApiServices(apisRes.data);
             setKeywords(keywordsRes.data);
             setSchedules(schedulesRes.data);
             setNotifications(notificationsRes.data);
@@ -216,6 +244,90 @@ const SettingsPage: React.FC = observer(() => {
 
     const handleTabChange = (event: React.SyntheticEvent, newValue: number) => {
         setTabValue(newValue);
+    };
+
+    // API Service handlers
+    const handleAddApiService = () => {
+        setEditingApiService({
+            id: 0,
+            name: '',
+            service_code: 'yandex_aon',
+            api_url: '',
+            headers: '{}',
+            method: 'GET',
+            request_body: '',
+            timeout: 30,
+            is_active: true,
+        });
+        setApiDialogOpen(true);
+    };
+
+    const handleEditApiService = (service: APIService) => {
+        setEditingApiService(service);
+        setApiDialogOpen(true);
+    };
+
+    const handleSaveApiService = async () => {
+        if (!editingApiService) return;
+
+        try {
+            // Validate headers JSON
+            if (editingApiService.headers) {
+                try {
+                    JSON.parse(editingApiService.headers);
+                } catch {
+                    enqueueSnackbar('Invalid headers JSON format', { variant: 'error' });
+                    return;
+                }
+            }
+
+            if (editingApiService.id === 0) {
+                const res = await axios.post('/api-services', editingApiService);
+                setApiServices([...apiServices, res.data]);
+            } else {
+                await axios.put(`/api-services/${editingApiService.id}`, editingApiService);
+                setApiServices(apiServices.map(s => s.id === editingApiService.id ? editingApiService : s));
+            }
+            setApiDialogOpen(false);
+            enqueueSnackbar(t('common.success'), { variant: 'success' });
+        } catch (error) {
+            enqueueSnackbar(t('errors.saveFailed'), { variant: 'error' });
+        }
+    };
+
+    const handleDeleteApiService = async (id: number) => {
+        if (!window.confirm(t('confirmations.deleteConfirmation'))) return;
+
+        try {
+            await axios.delete(`/api-services/${id}`);
+            setApiServices(apiServices.filter(s => s.id !== id));
+            enqueueSnackbar(t('common.success'), { variant: 'success' });
+        } catch (error) {
+            enqueueSnackbar(t('errors.deleteFailed'), { variant: 'error' });
+        }
+    };
+
+    const handleTestApiService = async (id: number) => {
+        if (!testPhoneNumber) {
+            enqueueSnackbar('Please enter a phone number to test', { variant: 'warning' });
+            return;
+        }
+
+        setTestingApiService(id);
+        setTestResults(null);
+
+        try {
+            const res = await axios.post(`/api-services/${id}/test`, {
+                phone_number: testPhoneNumber,
+            });
+            setTestResults(res.data);
+            enqueueSnackbar('Test completed', { variant: 'success' });
+        } catch (error: any) {
+            enqueueSnackbar(error.response?.data?.error || 'Test failed', { variant: 'error' });
+            setTestResults({ error: error.response?.data?.error || 'Test failed' });
+        } finally {
+            setTestingApiService(null);
+        }
     };
 
     const handleSaveGateway = async () => {
@@ -536,6 +648,24 @@ const SettingsPage: React.FC = observer(() => {
         setAdbDialogOpen(true);
     };
 
+    const formatJson = (jsonString: string) => {
+        try {
+            const parsed = JSON.parse(jsonString);
+            return JSON.stringify(parsed, null, 2);
+        } catch {
+            return jsonString;
+        }
+    };
+
+    const validateJson = (jsonString: string) => {
+        try {
+            JSON.parse(jsonString);
+            return true;
+        } catch {
+            return false;
+        }
+    };
+
     return (
         <Box>
             {isLoading ? (
@@ -548,6 +678,7 @@ const SettingsPage: React.FC = observer(() => {
                         <Tabs value={tabValue} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
                             <Tab icon={<SettingsIcon />} label={t('settings.general')} />
                             <Tab icon={<Android />} label={t('settings.adbGateways')} />
+                            <Tab icon={<Api />} label="API Services" />
                             <Tab icon={<Scanner />} label={t('settings.ocrSettings')} />
                             <Tab icon={<TextFields />} label={t('settings.keywords')} />
                             <Tab icon={<Schedule />} label={t('settings.schedules')} />
@@ -560,6 +691,34 @@ const SettingsPage: React.FC = observer(() => {
                         {/* General Settings */}
                         <TabPanel value={tabValue} index={0}>
                             <Grid container spacing={3}>
+                                <Grid item xs={12}>
+                                    <Typography variant="h6" sx={{ mb: 2 }}>Check Mode</Typography>
+                                    <FormControl component="fieldset">
+                                        <RadioGroup
+                                            value={generalSettings.check_mode}
+                                            onChange={(e) => setGeneralSettings({ ...generalSettings, check_mode: e.target.value })}
+                                        >
+                                            <FormControlLabel
+                                                value="adb_only"
+                                                control={<Radio />}
+                                                label="ADB Gateways Only - Check using Android emulators"
+                                            />
+                                            <FormControlLabel
+                                                value="api_only"
+                                                control={<Radio />}
+                                                label="API Services Only - Check using external APIs"
+                                            />
+                                            <FormControlLabel
+                                                value="both"
+                                                control={<Radio />}
+                                                label="Both - Check using both ADB gateways and API services"
+                                            />
+                                        </RadioGroup>
+                                    </FormControl>
+                                </Grid>
+                                <Grid item xs={12}>
+                                    <Divider sx={{ my: 2 }} />
+                                </Grid>
                                 <Grid item xs={12} md={6}>
                                     <TextField
                                         fullWidth
@@ -668,8 +827,97 @@ const SettingsPage: React.FC = observer(() => {
                             </List>
                         </TabPanel>
 
-                        {/* OCR Settings */}
+                        {/* API Services */}
                         <TabPanel value={tabValue} index={2}>
+                            <Box sx={{ mb: 3, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <Typography variant="h6">API Services</Typography>
+                                <Button variant="contained" startIcon={<Add />} onClick={handleAddApiService}>
+                                    Add API Service
+                                </Button>
+                            </Box>
+                            <List>
+                                {apiServices.map((service) => (
+                                    <Paper key={service.id} sx={{ mb: 2, p: 2 }}>
+                                        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flex: 1 }}>
+                                                <Api color={service.is_active ? 'success' : 'disabled'} />
+                                                <Box sx={{ flex: 1 }}>
+                                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                                        <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+                                                            {service.name}
+                                                        </Typography>
+                                                        <Chip
+                                                            label={service.method}
+                                                            size="small"
+                                                            color="primary"
+                                                            variant="outlined"
+                                                        />
+                                                        <Chip
+                                                            label={service.service_code}
+                                                            size="small"
+                                                            variant="outlined"
+                                                        />
+                                                    </Box>
+                                                    <Typography variant="body2" color="text.secondary" sx={{
+                                                        whiteSpace: 'nowrap',
+                                                        overflow: 'hidden',
+                                                        textOverflow: 'ellipsis',
+                                                        maxWidth: '600px'
+                                                    }}>
+                                                        {service.api_url}
+                                                    </Typography>
+                                                    <Typography variant="caption" color="text.secondary">
+                                                        Timeout: {service.timeout}s
+                                                    </Typography>
+                                                </Box>
+                                            </Box>
+                                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                                <TextField
+                                                    size="small"
+                                                    placeholder="Test phone number"
+                                                    value={testPhoneNumber}
+                                                    onChange={(e) => setTestPhoneNumber(e.target.value)}
+                                                    sx={{ width: 150 }}
+                                                />
+                                                <Tooltip title="Test API">
+                                                    <IconButton
+                                                        size="small"
+                                                        onClick={() => handleTestApiService(service.id)}
+                                                        disabled={testingApiService === service.id}
+                                                    >
+                                                        {testingApiService === service.id ? <CircularProgress size={20} /> : <PlayArrow />}
+                                                    </IconButton>
+                                                </Tooltip>
+                                                <IconButton size="small" onClick={() => handleEditApiService(service)}>
+                                                    <Edit />
+                                                </IconButton>
+                                                <IconButton size="small" color="error" onClick={() => handleDeleteApiService(service.id)}>
+                                                    <Delete />
+                                                </IconButton>
+                                            </Box>
+                                        </Box>
+                                        {testResults && testingApiService === null && (
+                                            <Box sx={{ mt: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                                                <Typography variant="subtitle2" sx={{ mb: 1 }}>Test Results:</Typography>
+                                                <pre style={{
+                                                    margin: 0,
+                                                    fontSize: '12px',
+                                                    whiteSpace: 'pre-wrap',
+                                                    wordBreak: 'break-word',
+                                                    maxHeight: '200px',
+                                                    overflow: 'auto'
+                                                }}>
+                                                    {JSON.stringify(testResults, null, 2)}
+                                                </pre>
+                                            </Box>
+                                        )}
+                                    </Paper>
+                                ))}
+                            </List>
+                        </TabPanel>
+
+                        {/* OCR Settings */}
+                        <TabPanel value={tabValue} index={3}>
                             <Grid container spacing={3}>
                                 <Grid item xs={12} md={6}>
                                     <TextField
@@ -702,7 +950,7 @@ const SettingsPage: React.FC = observer(() => {
                         </TabPanel>
 
                         {/* Keywords */}
-                        <TabPanel value={tabValue} index={3}>
+                        <TabPanel value={tabValue} index={4}>
                             <Box sx={{ mb: 3 }}>
                                 <Typography variant="h6" sx={{ mb: 2 }}>{t('settings.spamDetectionKeywords')}</Typography>
                                 <Alert severity="info" sx={{ mb: 2 }}>
@@ -730,7 +978,7 @@ const SettingsPage: React.FC = observer(() => {
                         </TabPanel>
 
                         {/* Schedules */}
-                        <TabPanel value={tabValue} index={4}>
+                        <TabPanel value={tabValue} index={5}>
                             <Box sx={{ mb: 3, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                 <Typography variant="h6">{t('settings.checkSchedules')}</Typography>
                                 <Button variant="contained" startIcon={<Add />} onClick={handleAddSchedule}>
@@ -762,7 +1010,7 @@ const SettingsPage: React.FC = observer(() => {
                         </TabPanel>
 
                         {/* Notifications */}
-                        <TabPanel value={tabValue} index={5}>
+                        <TabPanel value={tabValue} index={6}>
                             <Box sx={{ mb: 3, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                 <Typography variant="h6">{t('settings.notificationChannels')}</Typography>
                                 <Button variant="contained" startIcon={<Add />} onClick={handleAddNotification}>
@@ -800,7 +1048,7 @@ const SettingsPage: React.FC = observer(() => {
                         </TabPanel>
 
                         {/* Database */}
-                        <TabPanel value={tabValue} index={6}>
+                        <TabPanel value={tabValue} index={7}>
                             <Typography variant="h6" sx={{ mb: 3 }}>{t('settings.databaseConfiguration')}</Typography>
                             <Alert severity="info">
                                 {t('settings.databaseConfigHelp')}
