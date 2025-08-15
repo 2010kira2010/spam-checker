@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { observer } from 'mobx-react-lite';
 import { useTranslation } from 'react-i18next';
@@ -37,6 +38,7 @@ import {
     Divider,
     SvgIcon,
     SvgIconProps,
+    LinearProgress,
 } from '@mui/material';
 import {
     Settings as SettingsIcon,
@@ -58,6 +60,7 @@ import {
     OpenInNew,
     Api,
     PlayArrow,
+    Code,
 } from '@mui/icons-material';
 import { useSnackbar } from 'notistack';
 import axios from 'axios';
@@ -183,6 +186,8 @@ const SettingsPage: React.FC = observer(() => {
     const [testingApiService, setTestingApiService] = useState<number | null>(null);
     const [testPhoneNumber, setTestPhoneNumber] = useState('');
     const [testResults, setTestResults] = useState<any>(null);
+    const [headersEditorOpen, setHeadersEditorOpen] = useState(false);
+    const [editingHeaders, setEditingHeaders] = useState('');
 
     // Keywords
     const [keywords, setKeywords] = useState<SpamKeyword[]>([]);
@@ -251,7 +256,7 @@ const SettingsPage: React.FC = observer(() => {
         setEditingApiService({
             id: 0,
             name: '',
-            service_code: 'yandex_aon',
+            service_code: 'custom',
             api_url: '',
             headers: '{}',
             method: 'GET',
@@ -328,6 +333,50 @@ const SettingsPage: React.FC = observer(() => {
         } finally {
             setTestingApiService(null);
         }
+    };
+
+    const handleToggleApiService = async (service: APIService) => {
+        try {
+            await axios.post(`/api-services/${service.id}/toggle`);
+            setApiServices(apiServices.map(s =>
+                s.id === service.id ? { ...s, is_active: !s.is_active } : s
+            ));
+            enqueueSnackbar(t('common.success'), { variant: 'success' });
+        } catch (error) {
+            enqueueSnackbar(t('errors.updateFailed'), { variant: 'error' });
+        }
+    };
+
+    const handleOpenHeadersEditor = (headers: string) => {
+        try {
+            const parsed = JSON.parse(headers || '{}');
+            setEditingHeaders(JSON.stringify(parsed, null, 2));
+        } catch {
+            setEditingHeaders('{}');
+        }
+        setHeadersEditorOpen(true);
+    };
+
+    const handleSaveHeaders = () => {
+        try {
+            JSON.parse(editingHeaders);
+            if (editingApiService) {
+                setEditingApiService({ ...editingApiService, headers: editingHeaders });
+            }
+            setHeadersEditorOpen(false);
+        } catch {
+            enqueueSnackbar('Invalid JSON format', { variant: 'error' });
+        }
+    };
+
+    const exampleHeaders = {
+        "App-Build-Number": "257",
+        "App-Version-Name": "25.7",
+        "Accept-Language": "ru",
+        "OS-Name": "iOS",
+        "OS-Version": "18.5",
+        "X-Src": "ru.yandex.mobile.search",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X)",
     };
 
     const handleSaveGateway = async () => {
@@ -835,6 +884,24 @@ const SettingsPage: React.FC = observer(() => {
                                     Add API Service
                                 </Button>
                             </Box>
+
+                            {testPhoneNumber === '' && (
+                                <Alert severity="info" sx={{ mb: 2 }}>
+                                    Enter a test phone number to test API services instantly
+                                </Alert>
+                            )}
+
+                            <Box sx={{ mb: 3 }}>
+                                <TextField
+                                    fullWidth
+                                    label="Test Phone Number"
+                                    placeholder="+7 (999) 123-45-67"
+                                    value={testPhoneNumber}
+                                    onChange={(e) => setTestPhoneNumber(e.target.value)}
+                                    helperText="Enter a phone number to test API services"
+                                />
+                            </Box>
+
                             <List>
                                 {apiServices.map((service) => (
                                     <Paper key={service.id} sx={{ mb: 2, p: 2 }}>
@@ -857,6 +924,11 @@ const SettingsPage: React.FC = observer(() => {
                                                             size="small"
                                                             variant="outlined"
                                                         />
+                                                        <Chip
+                                                            label={service.is_active ? 'Active' : 'Inactive'}
+                                                            size="small"
+                                                            color={service.is_active ? 'success' : 'default'}
+                                                        />
                                                     </Box>
                                                     <Typography variant="body2" color="text.secondary" sx={{
                                                         whiteSpace: 'nowrap',
@@ -872,20 +944,21 @@ const SettingsPage: React.FC = observer(() => {
                                                 </Box>
                                             </Box>
                                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                                <TextField
-                                                    size="small"
-                                                    placeholder="Test phone number"
-                                                    value={testPhoneNumber}
-                                                    onChange={(e) => setTestPhoneNumber(e.target.value)}
-                                                    sx={{ width: 150 }}
-                                                />
                                                 <Tooltip title="Test API">
                                                     <IconButton
                                                         size="small"
                                                         onClick={() => handleTestApiService(service.id)}
-                                                        disabled={testingApiService === service.id}
+                                                        disabled={testingApiService === service.id || !testPhoneNumber}
                                                     >
                                                         {testingApiService === service.id ? <CircularProgress size={20} /> : <PlayArrow />}
+                                                    </IconButton>
+                                                </Tooltip>
+                                                <Tooltip title="Toggle Active">
+                                                    <IconButton
+                                                        size="small"
+                                                        onClick={() => handleToggleApiService(service)}
+                                                    >
+                                                        <Switch checked={service.is_active} />
                                                     </IconButton>
                                                 </Tooltip>
                                                 <IconButton size="small" onClick={() => handleEditApiService(service)}>
@@ -896,19 +969,49 @@ const SettingsPage: React.FC = observer(() => {
                                                 </IconButton>
                                             </Box>
                                         </Box>
-                                        {testResults && testingApiService === null && (
+                                        {testResults && testingApiService === null && testResults.url === service.api_url && (
                                             <Box sx={{ mt: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
                                                 <Typography variant="subtitle2" sx={{ mb: 1 }}>Test Results:</Typography>
-                                                <pre style={{
-                                                    margin: 0,
-                                                    fontSize: '12px',
-                                                    whiteSpace: 'pre-wrap',
-                                                    wordBreak: 'break-word',
-                                                    maxHeight: '200px',
-                                                    overflow: 'auto'
-                                                }}>
-                                                    {JSON.stringify(testResults, null, 2)}
-                                                </pre>
+                                                {testResults.error ? (
+                                                    <Alert severity="error">{testResults.error}</Alert>
+                                                ) : (
+                                                    <>
+                                                        <Box sx={{ display: 'flex', gap: 2, mb: 1 }}>
+                                                            <Chip
+                                                                label={`Status: ${testResults.status_code}`}
+                                                                color={testResults.status_code === 200 ? 'success' : 'error'}
+                                                                size="small"
+                                                            />
+                                                            <Chip
+                                                                label={`Response Time: ${testResults.response_time}ms`}
+                                                                size="small"
+                                                            />
+                                                            <Chip
+                                                                label={testResults.is_spam ? 'Spam Detected' : 'Clean'}
+                                                                color={testResults.is_spam ? 'error' : 'success'}
+                                                                size="small"
+                                                            />
+                                                        </Box>
+                                                        {testResults.keywords && testResults.keywords.length > 0 && (
+                                                            <Box sx={{ mb: 1 }}>
+                                                                <Typography variant="caption">Keywords found: </Typography>
+                                                                {testResults.keywords.map((kw: string, idx: number) => (
+                                                                    <Chip key={idx} label={kw} size="small" sx={{ ml: 0.5 }} />
+                                                                ))}
+                                                            </Box>
+                                                        )}
+                                                        <pre style={{
+                                                            margin: 0,
+                                                            fontSize: '12px',
+                                                            whiteSpace: 'pre-wrap',
+                                                            wordBreak: 'break-word',
+                                                            maxHeight: '200px',
+                                                            overflow: 'auto'
+                                                        }}>
+                                                            {testResults.response}
+                                                        </pre>
+                                                    </>
+                                                )}
                                             </Box>
                                         )}
                                     </Paper>

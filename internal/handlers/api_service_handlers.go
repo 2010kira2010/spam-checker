@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"spam-checker/internal/middleware"
 	"spam-checker/internal/models"
 	"spam-checker/internal/services"
@@ -12,8 +13,8 @@ import (
 // CreateAPIServiceRequest represents API service creation request
 type CreateAPIServiceRequest struct {
 	Name        string `json:"name" validate:"required"`
-	ServiceCode string `json:"service_code" validate:"required,oneof=yandex_aon kaspersky getcontact"`
-	APIURL      string `json:"api_url" validate:"required,url"`
+	ServiceCode string `json:"service_code" validate:"required,oneof=yandex_aon kaspersky getcontact custom"`
+	APIURL      string `json:"api_url" validate:"required"`
 	Headers     string `json:"headers"`
 	Method      string `json:"method" validate:"required,oneof=GET POST"`
 	RequestBody string `json:"request_body"`
@@ -50,6 +51,7 @@ func RegisterAPIServiceRoutes(api fiber.Router, apiService *services.APICheckSer
 	apis.Put("/:id", authMiddleware.RequireRole(models.RoleAdmin), updateAPIServiceHandler(apiService))
 	apis.Delete("/:id", authMiddleware.RequireRole(models.RoleAdmin), deleteAPIServiceHandler(apiService))
 	apis.Post("/:id/test", testAPIServiceHandler(apiService))
+	apis.Post("/:id/toggle", toggleAPIServiceHandler(apiService))
 }
 
 // listAPIServicesHandler godoc
@@ -129,11 +131,17 @@ func createAPIServiceHandler(apiService *services.APICheckService) fiber.Handler
 			timeout = 30
 		}
 
+		// Set default headers if not provided
+		headers := req.Headers
+		if headers == "" {
+			headers = "{}"
+		}
+
 		service := &models.APIService{
 			Name:        req.Name,
 			ServiceCode: req.ServiceCode,
 			APIURL:      req.APIURL,
-			Headers:     req.Headers,
+			Headers:     headers,
 			Method:      req.Method,
 			RequestBody: req.RequestBody,
 			Timeout:     timeout,
@@ -281,5 +289,53 @@ func testAPIServiceHandler(apiService *services.APICheckService) fiber.Handler {
 		}
 
 		return c.JSON(result)
+	}
+}
+
+// toggleAPIServiceHandler godoc
+// @Summary Toggle API service
+// @Description Enable or disable API service
+// @Tags api-services
+// @Accept json
+// @Produce json
+// @Param id path int true "API Service ID"
+// @Success 200 {object} MessageResponse
+// @Security BearerAuth
+// @Router /api-services/{id}/toggle [post]
+func toggleAPIServiceHandler(apiService *services.APICheckService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		id, err := strconv.ParseUint(c.Params("id"), 10, 32)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid API service ID",
+			})
+		}
+
+		service, err := apiService.GetAPIServiceByID(uint(id))
+		if err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+		}
+
+		// Toggle active status
+		updates := map[string]interface{}{
+			"is_active": !service.IsActive,
+		}
+
+		if err := apiService.UpdateAPIService(uint(id), updates); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+		}
+
+		status := "disabled"
+		if !service.IsActive {
+			status = "enabled"
+		}
+
+		return c.JSON(MessageResponse{
+			Message: fmt.Sprintf("API service %s successfully", status),
+		})
 	}
 }

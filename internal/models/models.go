@@ -49,6 +49,7 @@ type SpamService struct {
 	Name      string    `gorm:"unique;not null" json:"name"`
 	Code      string    `gorm:"unique;not null" json:"code"`
 	IsActive  bool      `gorm:"default:true" json:"is_active"`
+	IsCustom  bool      `gorm:"default:false" json:"is_custom"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
