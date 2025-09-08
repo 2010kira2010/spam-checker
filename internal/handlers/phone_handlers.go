@@ -25,10 +25,10 @@ type UpdatePhoneRequest struct {
 
 // PhonesListResponse represents phones list response
 type PhonesListResponse struct {
-	Phones []models.PhoneNumber `json:"phones"`
-	Total  int64                `json:"total"`
-	Page   int                  `json:"page"`
-	Limit  int                  `json:"limit"`
+	Phones []map[string]interface{} `json:"phones"`
+	Total  int64                    `json:"total"`
+	Page   int                      `json:"page"`
+	Limit  int                      `json:"limit"`
 }
 
 // ImportPhonesResponse represents import phones response
@@ -53,7 +53,7 @@ func RegisterPhoneRoutes(api fiber.Router, phoneService *services.PhoneService, 
 
 // listPhonesHandler godoc
 // @Summary List phones
-// @Description Get list of phone numbers with pagination
+// @Description Get list of phone numbers with pagination and latest check results
 // @Tags phones
 // @Accept json
 // @Produce json
@@ -77,7 +77,9 @@ func listPhonesHandler(phoneService *services.PhoneService) fiber.Handler {
 		}
 
 		offset := (page - 1) * limit
-		phones, total, err := phoneService.ListPhones(offset, limit, search, isActive)
+
+		// Use the new method that returns detailed data
+		phones, total, err := phoneService.ListPhonesWithDetails(offset, limit, search, isActive)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Failed to get phones",
@@ -95,12 +97,12 @@ func listPhonesHandler(phoneService *services.PhoneService) fiber.Handler {
 
 // getPhoneByIDHandler godoc
 // @Summary Get phone
-// @Description Get phone number by ID
+// @Description Get phone number by ID with check results
 // @Tags phones
 // @Accept json
 // @Produce json
 // @Param id path int true "Phone ID"
-// @Success 200 {object} models.PhoneNumber
+// @Success 200 {object} map[string]interface{}
 // @Security BearerAuth
 // @Router /phones/{id} [get]
 func getPhoneByIDHandler(phoneService *services.PhoneService) fiber.Handler {
@@ -119,7 +121,47 @@ func getPhoneByIDHandler(phoneService *services.PhoneService) fiber.Handler {
 			})
 		}
 
-		return c.JSON(phone)
+		// Format response with check results
+		response := map[string]interface{}{
+			"id":          phone.ID,
+			"number":      phone.Number,
+			"description": phone.Description,
+			"is_active":   phone.IsActive,
+			"created_by":  phone.CreatedBy,
+			"created_at":  phone.CreatedAt,
+			"updated_at":  phone.UpdatedAt,
+		}
+
+		// Format check results
+		checkResults := make([]map[string]interface{}, len(phone.CheckResults))
+		for i, result := range phone.CheckResults {
+			checkResults[i] = map[string]interface{}{
+				"id": result.ID,
+				"service": map[string]interface{}{
+					"id":   result.Service.ID,
+					"name": result.Service.Name,
+					"code": result.Service.Code,
+				},
+				"is_spam":        result.IsSpam,
+				"found_keywords": []string(result.FoundKeywords),
+				"screenshot":     result.Screenshot,
+				"raw_text":       result.RawText,
+				"checked_at":     result.CheckedAt,
+			}
+		}
+		response["check_results"] = checkResults
+
+		// Calculate overall spam status
+		isSpam := false
+		for _, result := range phone.CheckResults {
+			if result.IsSpam {
+				isSpam = true
+				break
+			}
+		}
+		response["is_spam"] = isSpam
+
+		return c.JSON(response)
 	}
 }
 
