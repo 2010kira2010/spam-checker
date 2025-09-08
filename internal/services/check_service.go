@@ -27,6 +27,7 @@ type CheckService struct {
 	apiService       *APICheckService
 	gatewayLocks     map[uint]*sync.Mutex
 	gatewayLocksMu   sync.RWMutex
+	gatewayBusy      map[uint]bool // Track gateway busy state in memory
 	phoneCheckLocks  map[uint]*sync.Mutex
 	phoneCheckMu     sync.RWMutex
 	resultWriteMutex sync.Mutex // Global mutex for writing results
@@ -63,6 +64,7 @@ func NewCheckService(db *gorm.DB, cfg *config.Config) *CheckService {
 		adbService:      NewADBServiceWithConfig(db, cfg),
 		apiService:      NewAPICheckService(db),
 		gatewayLocks:    make(map[uint]*sync.Mutex),
+		gatewayBusy:     make(map[uint]bool),
 		phoneCheckLocks: make(map[uint]*sync.Mutex),
 		log:             logger.WithField("service", "CheckService"),
 	}
@@ -99,13 +101,32 @@ func (s *CheckService) getPhoneCheckLock(phoneID uint) *sync.Mutex {
 // tryLockGateway attempts to lock a gateway without blocking
 func (s *CheckService) tryLockGateway(gatewayID uint) bool {
 	lock := s.getGatewayLock(gatewayID)
-	return lock.TryLock()
+	if lock.TryLock() {
+		// Mark gateway as busy in memory
+		s.gatewayLocksMu.Lock()
+		s.gatewayBusy[gatewayID] = true
+		s.gatewayLocksMu.Unlock()
+		return true
+	}
+	return false
 }
 
 // unlockGateway releases gateway lock
 func (s *CheckService) unlockGateway(gatewayID uint) {
 	lock := s.getGatewayLock(gatewayID)
 	lock.Unlock()
+
+	// Mark gateway as available in memory
+	s.gatewayLocksMu.Lock()
+	s.gatewayBusy[gatewayID] = false
+	s.gatewayLocksMu.Unlock()
+}
+
+// isGatewayBusy checks if gateway is busy
+func (s *CheckService) isGatewayBusy(gatewayID uint) bool {
+	s.gatewayLocksMu.RLock()
+	defer s.gatewayLocksMu.RUnlock()
+	return s.gatewayBusy[gatewayID]
 }
 
 // CheckPhoneNumber checks a single phone number across all services
@@ -433,12 +454,8 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 
 	log.Infof("Checking %s on %s (gateway: %s)", phone.Number, service.Name, gateway.Name)
 
-	// Update gateway status to indicate it's busy
-	s.db.Model(gateway).Update("status", "checking")
-	defer func() {
-		// Reset status when done
-		s.db.Model(gateway).Update("status", "online")
-	}()
+	// Don't update gateway status in DB, use in-memory locking instead
+	// The gateway lock already prevents concurrent usage
 
 	// Since apps are pre-installed, we just need to ensure the app is running
 	appPackage, appActivity := s.getAppInfo(gateway.ServiceCode)
@@ -1004,15 +1021,20 @@ func (s *CheckService) GetGatewayStatuses() ([]map[string]interface{}, error) {
 
 	statuses := make([]map[string]interface{}, len(gateways))
 	for i, gateway := range gateways {
-		s.gatewayLocksMu.RLock()
-		_, isLocked := s.gatewayLocks[gateway.ID]
-		s.gatewayLocksMu.RUnlock()
+		// Check if gateway is busy
+		isBusy := s.isGatewayBusy(gateway.ID)
+
+		// Determine actual status
+		actualStatus := gateway.Status
+		if isBusy && gateway.Status == "online" {
+			actualStatus = "checking"
+		}
 
 		statuses[i] = map[string]interface{}{
 			"id":        gateway.ID,
 			"name":      gateway.Name,
-			"status":    gateway.Status,
-			"is_locked": isLocked,
+			"status":    actualStatus,
+			"is_locked": isBusy,
 			"service":   gateway.ServiceCode,
 		}
 	}
