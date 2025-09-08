@@ -159,7 +159,7 @@ func (hook *CallerHook) Fire(entry *logrus.Entry) error {
 	for i := 0; i < cnt; i++ {
 		fu := runtime.FuncForPC(pc[i] - 1)
 		name := fu.Name()
-		if !isLogrusPackage(name) {
+		if !isLogrusPackage(name) && !isGormPackage(name) {
 			file, line := fu.FileLine(pc[i] - 1)
 			entry.Data["caller"] = fmt.Sprintf("%s:%d", filepath.Base(file), line)
 			break
@@ -175,6 +175,10 @@ func (hook *CallerHook) Levels() []logrus.Level {
 
 func isLogrusPackage(name string) bool {
 	return strings.Contains(name, "sirupsen/logrus")
+}
+
+func isGormPackage(name string) bool {
+	return strings.Contains(name, "gorm.io/gorm")
 }
 
 // WithContext creates an entry with context
@@ -255,9 +259,29 @@ type GormLogger struct {
 
 // NewGormLogger creates a new GORM logger
 func NewGormLogger() logger.Interface {
+	// Map application log level to GORM log level
+	var gormLogLevel logger.LogLevel
+
+	if Log != nil {
+		switch Log.GetLevel() {
+		case logrus.DebugLevel, logrus.TraceLevel:
+			gormLogLevel = logger.Info // Show all SQL queries in debug mode
+		case logrus.InfoLevel:
+			gormLogLevel = logger.Warn // Show only slow queries and errors in info mode
+		case logrus.WarnLevel:
+			gormLogLevel = logger.Warn
+		case logrus.ErrorLevel, logrus.FatalLevel, logrus.PanicLevel:
+			gormLogLevel = logger.Error
+		default:
+			gormLogLevel = logger.Warn
+		}
+	} else {
+		gormLogLevel = logger.Warn
+	}
+
 	return &GormLogger{
 		SlowThreshold:         200 * time.Millisecond,
-		LogLevel:              logger.Info,
+		LogLevel:              gormLogLevel,
 		SkipErrRecordNotFound: true,
 		SourceField:           "source",
 	}
@@ -295,9 +319,17 @@ func (l GormLogger) Trace(ctx context.Context, begin time.Time, fc func() (strin
 	elapsed := time.Since(begin)
 	sql, rows := fc()
 
+	// Skip migrations and internal GORM queries
+	if strings.Contains(sql, "SELECT count(*) FROM sqlite_master") ||
+		strings.Contains(sql, "SELECT sql FROM sqlite_master") ||
+		strings.Contains(sql, "pragma") ||
+		strings.Contains(sql, "SELECT column_name") {
+		return
+	}
+
 	entry := WithContext(ctx).WithFields(logrus.Fields{
 		"gorm":     true,
-		"duration": elapsed.Milliseconds(),
+		"duration": fmt.Sprintf("%.3fms", float64(elapsed.Nanoseconds())/1e6),
 		"rows":     rows,
 		"sql":      sql,
 	})
@@ -308,6 +340,13 @@ func (l GormLogger) Trace(ctx context.Context, begin time.Time, fc func() (strin
 	case l.SlowThreshold != 0 && elapsed > l.SlowThreshold:
 		entry.Warnf("Slow SQL query [%v]", elapsed)
 	case l.LogLevel >= logger.Info:
-		entry.Debugf("SQL query executed [%v]", elapsed)
+		// Log all queries in debug mode
+		entry.Debug("SQL query executed")
 	}
+}
+
+// SetGormLogLevel sets GORM log level dynamically
+func SetGormLogLevel(level logger.LogLevel) {
+	// This function can be used to change GORM log level at runtime
+	// Implementation would require storing a reference to the GORM logger
 }

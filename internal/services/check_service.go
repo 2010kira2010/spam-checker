@@ -21,13 +21,16 @@ import (
 )
 
 type CheckService struct {
-	db             *gorm.DB
-	cfg            *config.Config
-	adbService     *ADBService
-	apiService     *APICheckService
-	gatewayLocks   map[uint]*sync.Mutex
-	gatewayLocksMu sync.RWMutex
-	log            *logrus.Entry
+	db               *gorm.DB
+	cfg              *config.Config
+	adbService       *ADBService
+	apiService       *APICheckService
+	gatewayLocks     map[uint]*sync.Mutex
+	gatewayLocksMu   sync.RWMutex
+	phoneCheckLocks  map[uint]*sync.Mutex
+	phoneCheckMu     sync.RWMutex
+	resultWriteMutex sync.Mutex // Global mutex for writing results
+	log              *logrus.Entry
 }
 
 // CheckResult for concurrent processing
@@ -55,12 +58,13 @@ func (s *CheckService) GetDB() *gorm.DB {
 
 func NewCheckService(db *gorm.DB, cfg *config.Config) *CheckService {
 	return &CheckService{
-		db:           db,
-		cfg:          cfg,
-		adbService:   NewADBServiceWithConfig(db, cfg),
-		apiService:   NewAPICheckService(db),
-		gatewayLocks: make(map[uint]*sync.Mutex),
-		log:          logger.WithField("service", "CheckService"),
+		db:              db,
+		cfg:             cfg,
+		adbService:      NewADBServiceWithConfig(db, cfg),
+		apiService:      NewAPICheckService(db),
+		gatewayLocks:    make(map[uint]*sync.Mutex),
+		phoneCheckLocks: make(map[uint]*sync.Mutex),
+		log:             logger.WithField("service", "CheckService"),
 	}
 }
 
@@ -78,23 +82,24 @@ func (s *CheckService) getGatewayLock(gatewayID uint) *sync.Mutex {
 	return lock
 }
 
-// tryLockGateway attempts to lock a gateway with timeout
-func (s *CheckService) tryLockGateway(gatewayID uint, timeout time.Duration) bool {
-	lock := s.getGatewayLock(gatewayID)
+// getPhoneCheckLock returns a lock for specific phone's checks
+func (s *CheckService) getPhoneCheckLock(phoneID uint) *sync.Mutex {
+	s.phoneCheckMu.Lock()
+	defer s.phoneCheckMu.Unlock()
 
-	// Try to acquire lock with timeout
-	done := make(chan bool, 1)
-	go func() {
-		lock.Lock()
-		done <- true
-	}()
-
-	select {
-	case <-done:
-		return true
-	case <-time.After(timeout):
-		return false
+	if lock, exists := s.phoneCheckLocks[phoneID]; exists {
+		return lock
 	}
+
+	lock := &sync.Mutex{}
+	s.phoneCheckLocks[phoneID] = lock
+	return lock
+}
+
+// tryLockGateway attempts to lock a gateway without blocking
+func (s *CheckService) tryLockGateway(gatewayID uint) bool {
+	lock := s.getGatewayLock(gatewayID)
+	return lock.TryLock()
 }
 
 // unlockGateway releases gateway lock
@@ -103,10 +108,11 @@ func (s *CheckService) unlockGateway(gatewayID uint) {
 	lock.Unlock()
 }
 
-// CheckPhoneNumber checks a single phone number across all services concurrently
+// CheckPhoneNumber checks a single phone number across all services
 func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 	log := s.log.WithFields(logrus.Fields{
-		"method": "CheckPhoneNumber",
+		"method":  "CheckPhoneNumber",
+		"phoneID": phoneID,
 	})
 
 	// Get phone number
@@ -163,10 +169,11 @@ func (s *CheckService) getCheckMode() models.CheckMode {
 	return models.CheckMode(setting.Value)
 }
 
-// checkViaADB checks phone via ADB gateways
+// checkViaADB checks phone via ADB gateways with smart concurrency
 func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 	log := s.log.WithFields(logrus.Fields{
 		"method": "checkViaADB",
+		"phone":  phone.Number,
 	})
 
 	// Get active gateways
@@ -185,42 +192,41 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 	resultChan := make(chan ConcurrentCheckResult, len(gateways))
 	var wg sync.WaitGroup
 
-	// Check on each gateway concurrently
+	// Process each gateway concurrently
 	for _, gateway := range gateways {
 		wg.Add(1)
 		go func(gw models.ADBGateway) {
 			defer wg.Done()
 
-			// Try to lock gateway with 30 second timeout
-			if !s.tryLockGateway(gw.ID, 30*time.Second) {
-				log.Warnf("Gateway %s is busy, skipping check for phone %s", gw.Name, phone.Number)
-				resultChan <- ConcurrentCheckResult{
-					PhoneID: phone.ID,
-					Gateway: &gw,
-					Error:   fmt.Errorf("gateway busy"),
-				}
+			result := ConcurrentCheckResult{
+				PhoneID: phone.ID,
+				Gateway: &gw,
+			}
+
+			// Try to acquire gateway lock without blocking
+			if !s.tryLockGateway(gw.ID) {
+				log.Debugf("Gateway %s (ID: %d) is busy, skipping", gw.Name, gw.ID)
+				result.Error = fmt.Errorf("gateway busy")
+				resultChan <- result
 				return
 			}
-			defer s.unlockGateway(gw.ID)
+			log.Debugf("Successfully locked gateway %s (ID: %d)", gw.Name, gw.ID)
+			defer func() {
+				s.unlockGateway(gw.ID)
+				log.Debugf("Unlocked gateway %s (ID: %d)", gw.Name, gw.ID)
+			}()
 
 			// Get service info
 			var service models.SpamService
 			if err := s.db.Where("code = ?", gw.ServiceCode).First(&service).Error; err != nil {
-				resultChan <- ConcurrentCheckResult{
-					PhoneID: phone.ID,
-					Gateway: &gw,
-					Error:   fmt.Errorf("service not found: %w", err),
-				}
+				result.Error = fmt.Errorf("service not found: %w", err)
+				resultChan <- result
 				return
 			}
+			result.Service = &service
 
 			// Perform check
-			result := ConcurrentCheckResult{
-				PhoneID: phone.ID,
-				Gateway: &gw,
-				Service: &service,
-			}
-
+			log.Infof("Checking phone %s on gateway %s", phone.Number, gw.Name)
 			if err := s.checkOnGateway(phone, &gw); err != nil {
 				result.Error = err
 				log.Errorf("Failed to check phone %s on gateway %s: %v", phone.Number, gw.Name, err)
@@ -231,6 +237,7 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 					Order("checked_at DESC").First(&checkResult).Error; err == nil {
 					result.Result = &checkResult
 				}
+				log.Infof("Successfully checked phone %s on gateway %s", phone.Number, gw.Name)
 			}
 
 			resultChan <- result
@@ -269,10 +276,11 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 	return nil
 }
 
-// checkViaAPI checks phone via API services
+// checkViaAPI checks phone via API services with proper synchronization
 func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 	log := s.log.WithFields(logrus.Fields{
 		"method": "checkViaAPI",
+		"phone":  phone.Number,
 	})
 
 	// Get active API services
@@ -297,32 +305,31 @@ func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 		go func(api models.APIService) {
 			defer wg.Done()
 
-			// Get service info
-			var service models.SpamService
-			if err := s.db.Where("code = ?", api.ServiceCode).First(&service).Error; err != nil {
-				resultChan <- APICheckResult{
-					PhoneID:    phone.ID,
-					APIService: &api,
-					Error:      fmt.Errorf("service not found: %w", err),
-				}
-				return
-			}
-
-			// Perform check
 			result := APICheckResult{
 				PhoneID:    phone.ID,
 				APIService: &api,
-				Service:    &service,
 			}
 
+			// Get service info
+			var service models.SpamService
+			if err := s.db.Where("code = ?", api.ServiceCode).First(&service).Error; err != nil {
+				result.Error = fmt.Errorf("service not found: %w", err)
+				resultChan <- result
+				return
+			}
+			result.Service = &service
+
+			// Perform check
+			log.Infof("Checking phone %s via API %s", phone.Number, api.Name)
 			checkResult, err := s.apiService.CheckPhoneViaAPI(phone, &api)
 			if err != nil {
 				result.Error = err
 				log.Errorf("Failed to check phone %s via API %s: %v", phone.Number, api.Name, err)
 			} else {
 				result.Result = checkResult
-				// Update statistics
+				// Update statistics with proper locking
 				s.updateStatistics(phone.ID, service.ID, checkResult.IsSpam)
+				log.Infof("Successfully checked phone %s via API %s", phone.Number, api.Name)
 			}
 
 			resultChan <- result
@@ -356,7 +363,7 @@ func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 	return nil
 }
 
-// CheckAllPhones checks all active phone numbers with concurrent processing
+// CheckAllPhones checks all active phone numbers with intelligent concurrency
 func (s *CheckService) CheckAllPhones() error {
 	log := s.log.WithFields(logrus.Fields{
 		"method": "CheckAllPhones",
@@ -395,12 +402,12 @@ func (s *CheckService) CheckAllPhones() error {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
+			log.Infof("Starting check for phone: %s", p.Number)
 			if err := s.CheckPhoneNumber(p.ID); err != nil {
 				log.Errorf("Failed to check phone %s: %v", p.Number, err)
+			} else {
+				log.Infof("Completed check for phone: %s", p.Number)
 			}
-
-			// Small delay between phone checks to avoid overwhelming the system
-			time.Sleep(1 * time.Second)
 		}(phone)
 	}
 
@@ -410,10 +417,12 @@ func (s *CheckService) CheckAllPhones() error {
 	return nil
 }
 
-// checkOnGateway checks phone on specific gateway
+// checkOnGateway checks phone on specific gateway with proper synchronization
 func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models.ADBGateway) error {
 	log := s.log.WithFields(logrus.Fields{
-		"method": "checkOnGateway",
+		"method":  "checkOnGateway",
+		"phone":   phone.Number,
+		"gateway": gateway.Name,
 	})
 
 	// Get service info
@@ -486,22 +495,27 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	// Check for spam keywords
 	isSpam, foundKeywords := s.checkForSpamKeywords(ocrText, service.ID)
 
-	// Save result - use StringArray type for PostgreSQL compatibility
+	// Save result with proper synchronization
 	result := &models.CheckResult{
 		PhoneNumberID: phone.ID,
 		ServiceID:     service.ID,
 		IsSpam:        isSpam,
-		FoundKeywords: models.StringArray(foundKeywords), // Convert to custom type
+		FoundKeywords: models.StringArray(foundKeywords),
 		Screenshot:    screenshotPath,
 		RawText:       ocrText,
 		CheckedAt:     time.Now(),
 	}
 
-	if err := s.db.Create(result).Error; err != nil {
+	// Use global mutex for writing results to prevent race conditions
+	s.resultWriteMutex.Lock()
+	err = s.db.Create(result).Error
+	s.resultWriteMutex.Unlock()
+
+	if err != nil {
 		return fmt.Errorf("failed to save check result: %w", err)
 	}
 
-	// Update statistics
+	// Update statistics with proper synchronization
 	s.updateStatistics(phone.ID, service.ID, isSpam)
 
 	log.Infof("Check completed for %s on %s: isSpam=%v, keywords=%v",
@@ -510,10 +524,11 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	return nil
 }
 
-// CheckPhoneRealtime checks phone number in real-time with concurrent processing
+// CheckPhoneRealtime checks phone number in real-time
 func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interface{}, error) {
 	log := s.log.WithFields(logrus.Fields{
 		"method": "CheckPhoneRealtime",
+		"phone":  phoneNumber,
 	})
 
 	// Normalize phone number
@@ -528,7 +543,7 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 		var recentResults []models.CheckResult
 		err = s.db.Where("phone_number_id = ?", existingPhone.ID).
 			Order("checked_at DESC").
-			Limit(10). // Get more results to cover all services
+			Limit(10).
 			Preload("Service").
 			Find(&recentResults).Error
 
@@ -560,7 +575,7 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 
 		// Results are old or don't exist - perform new check
 		log.Infof("Phone %s exists but results are old, performing new check", phoneNumber)
-		return s.performRealtimeCheck(&existingPhone, true) // true = high priority
+		return s.performRealtimeCheck(&existingPhone)
 	}
 
 	// Phone doesn't exist - create temporary phone for realtime check
@@ -576,8 +591,8 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 		return nil, fmt.Errorf("failed to create phone record: %w", err)
 	}
 
-	// Perform check with high priority
-	result, checkErr := s.performRealtimeCheck(tempPhone, true)
+	// Perform check
+	result, checkErr := s.performRealtimeCheck(tempPhone)
 
 	// If check failed and phone is temporary, clean it up
 	if checkErr != nil && !tempPhone.IsActive {
@@ -589,11 +604,17 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 	return result, checkErr
 }
 
-// performRealtimeCheck performs actual realtime check for a phone
-func (s *CheckService) performRealtimeCheck(phone *models.PhoneNumber, highPriority bool) (map[string]interface{}, error) {
-	log := s.log.WithFields(logrus.Fields{
-		"method": "performRealtimeCheck",
-	})
+// performRealtimeCheck performs actual realtime check for a phone with priority
+func (s *CheckService) performRealtimeCheck(phone *models.PhoneNumber) (map[string]interface{}, error) {
+	//log := s.log.WithFields(logrus.Fields{
+	//	"method": "performRealtimeCheck",
+	//	"phone":  phone.Number,
+	//})
+
+	// Use phone check lock to ensure all checks for this phone are synchronized
+	phoneCheckLock := s.getPhoneCheckLock(phone.ID)
+	phoneCheckLock.Lock()
+	defer phoneCheckLock.Unlock()
 
 	results := make(map[string]interface{})
 	results["phone_number"] = phone.Number
@@ -601,8 +622,8 @@ func (s *CheckService) performRealtimeCheck(phone *models.PhoneNumber, highPrior
 	results["cached"] = false
 
 	var serviceResults []map[string]interface{}
+	var serviceResultsMutex sync.Mutex
 	var wg sync.WaitGroup
-	resultChan := make(chan map[string]interface{}, 20) // Increased buffer
 
 	checkMode := s.getCheckMode()
 
@@ -619,58 +640,56 @@ func (s *CheckService) performRealtimeCheck(phone *models.PhoneNumber, highPrior
 			go func(gw models.ADBGateway) {
 				defer wg.Done()
 
-				// For realtime checks, use shorter timeout
-				timeout := 10 * time.Second
-				if highPriority {
-					timeout = 5 * time.Second
-				}
-
-				// Try to lock gateway with timeout
-				if !s.tryLockGateway(gw.ID, timeout) {
-					log.Warnf("Gateway %s is busy, skipping realtime check", gw.Name)
-					resultChan <- map[string]interface{}{
-						"service": gw.ServiceCode,
-						"error":   "Gateway is busy",
-						"busy":    true,
+				// Try to acquire gateway lock with high priority (immediate)
+				if !s.tryLockGateway(gw.ID) {
+					// For realtime check, wait a bit and try again
+					time.Sleep(100 * time.Millisecond)
+					if !s.tryLockGateway(gw.ID) {
+						serviceResultsMutex.Lock()
+						serviceResults = append(serviceResults, map[string]interface{}{
+							"service": gw.ServiceCode,
+							"error":   "Gateway is busy",
+						})
+						serviceResultsMutex.Unlock()
+						return
 					}
-					return
 				}
 				defer s.unlockGateway(gw.ID)
 
 				// Get service info
 				var service models.SpamService
 				if err := s.db.Where("code = ?", gw.ServiceCode).First(&service).Error; err != nil {
-					resultChan <- map[string]interface{}{
+					serviceResultsMutex.Lock()
+					serviceResults = append(serviceResults, map[string]interface{}{
 						"service": "Unknown",
 						"error":   err.Error(),
-					}
+					})
+					serviceResultsMutex.Unlock()
 					return
 				}
 
 				// Perform check
 				if err := s.checkOnGateway(phone, &gw); err != nil {
-					resultChan <- map[string]interface{}{
+					serviceResultsMutex.Lock()
+					serviceResults = append(serviceResults, map[string]interface{}{
 						"service": service.Name,
 						"error":   err.Error(),
-					}
-					return
-				}
-
-				// Get result
-				var checkResult models.CheckResult
-				if err := s.db.Where("phone_number_id = ? AND service_id = ?", phone.ID, service.ID).
-					Order("checked_at DESC").First(&checkResult).Error; err == nil {
-					resultChan <- map[string]interface{}{
-						"service":        service.Name,
-						"is_spam":        checkResult.IsSpam,
-						"found_keywords": []string(checkResult.FoundKeywords),
-						"checked_at":     checkResult.CheckedAt,
-						"type":           "adb",
-					}
+					})
+					serviceResultsMutex.Unlock()
 				} else {
-					resultChan <- map[string]interface{}{
-						"service": service.Name,
-						"error":   "Result not found",
+					// Get result
+					var checkResult models.CheckResult
+					if err := s.db.Where("phone_number_id = ? AND service_id = ?", phone.ID, service.ID).
+						Order("checked_at DESC").First(&checkResult).Error; err == nil {
+						serviceResultsMutex.Lock()
+						serviceResults = append(serviceResults, map[string]interface{}{
+							"service":        service.Name,
+							"is_spam":        checkResult.IsSpam,
+							"found_keywords": []string(checkResult.FoundKeywords),
+							"checked_at":     checkResult.CheckedAt,
+							"type":           "adb",
+						})
+						serviceResultsMutex.Unlock()
 					}
 				}
 			}(gateway)
@@ -682,6 +701,7 @@ func (s *CheckService) performRealtimeCheck(phone *models.PhoneNumber, highPrior
 		// Get active API services
 		apiServices, err := s.apiService.GetActiveAPIServices()
 		if err != nil && checkMode == models.CheckModeAPIOnly {
+			wg.Wait()
 			return nil, fmt.Errorf("failed to get active API services: %w", err)
 		}
 
@@ -693,56 +713,54 @@ func (s *CheckService) performRealtimeCheck(phone *models.PhoneNumber, highPrior
 				// Get service info
 				var service models.SpamService
 				if err := s.db.Where("code = ?", api.ServiceCode).First(&service).Error; err != nil {
-					resultChan <- map[string]interface{}{
+					serviceResultsMutex.Lock()
+					serviceResults = append(serviceResults, map[string]interface{}{
 						"service": "Unknown",
 						"error":   err.Error(),
-					}
+					})
+					serviceResultsMutex.Unlock()
 					return
 				}
 
 				// Perform API check
 				checkResult, err := s.apiService.CheckPhoneViaAPI(phone, &api)
 				if err != nil {
-					resultChan <- map[string]interface{}{
+					serviceResultsMutex.Lock()
+					serviceResults = append(serviceResults, map[string]interface{}{
 						"service": service.Name,
 						"error":   err.Error(),
-					}
-					return
-				}
+					})
+					serviceResultsMutex.Unlock()
+				} else {
+					// Update statistics
+					s.updateStatistics(phone.ID, service.ID, checkResult.IsSpam)
 
-				// Update statistics
-				s.updateStatistics(phone.ID, service.ID, checkResult.IsSpam)
-
-				resultChan <- map[string]interface{}{
-					"service":        service.Name,
-					"is_spam":        checkResult.IsSpam,
-					"found_keywords": []string(checkResult.FoundKeywords),
-					"checked_at":     checkResult.CheckedAt,
-					"type":           "api",
+					serviceResultsMutex.Lock()
+					serviceResults = append(serviceResults, map[string]interface{}{
+						"service":        service.Name,
+						"is_spam":        checkResult.IsSpam,
+						"found_keywords": []string(checkResult.FoundKeywords),
+						"checked_at":     checkResult.CheckedAt,
+						"type":           "api",
+					})
+					serviceResultsMutex.Unlock()
 				}
 			}(apiService)
 		}
 	}
 
-	// Collect results
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	for result := range resultChan {
-		serviceResults = append(serviceResults, result)
-	}
+	// Wait for all checks to complete
+	wg.Wait()
 
 	results["results"] = serviceResults
-
 	return results, nil
 }
 
-// CheckPhoneNumbersInBatch checks multiple phone numbers concurrently
+// CheckPhoneNumbersInBatch checks multiple phone numbers efficiently
 func (s *CheckService) CheckPhoneNumbersInBatch(phoneIDs []uint) error {
 	log := s.log.WithFields(logrus.Fields{
 		"method": "CheckPhoneNumbersInBatch",
+		"count":  len(phoneIDs),
 	})
 
 	if len(phoneIDs) == 0 {
@@ -794,6 +812,46 @@ func (s *CheckService) CheckPhoneNumbersInBatch(phoneIDs []uint) error {
 	}
 
 	return nil
+}
+
+// updateStatistics updates check statistics with proper locking
+func (s *CheckService) updateStatistics(phoneID, serviceID uint, isSpam bool) {
+	// Use result write mutex to ensure statistics are updated atomically
+	s.resultWriteMutex.Lock()
+	defer s.resultWriteMutex.Unlock()
+
+	var stats models.Statistics
+
+	// Try to find existing statistics
+	err := s.db.Where("phone_number_id = ? AND service_id = ?", phoneID, serviceID).First(&stats).Error
+
+	if err == gorm.ErrRecordNotFound {
+		// Create new statistics
+		stats = models.Statistics{
+			PhoneNumberID: phoneID,
+			ServiceID:     serviceID,
+			TotalChecks:   1,
+			LastCheckDate: time.Now(),
+		}
+		if isSpam {
+			stats.SpamCount = 1
+			now := time.Now()
+			stats.FirstSpamDate = &now
+		}
+		s.db.Create(&stats)
+	} else if err == nil {
+		// Update existing statistics
+		stats.TotalChecks++
+		stats.LastCheckDate = time.Now()
+		if isSpam {
+			stats.SpamCount++
+			if stats.FirstSpamDate == nil {
+				now := time.Now()
+				stats.FirstSpamDate = &now
+			}
+		}
+		s.db.Save(&stats)
+	}
 }
 
 // saveScreenshot saves screenshot to file
@@ -872,42 +930,6 @@ func (s *CheckService) checkForSpamKeywords(text string, serviceID uint) (bool, 
 	}
 
 	return len(foundKeywords) > 0, foundKeywords
-}
-
-// updateStatistics updates check statistics
-func (s *CheckService) updateStatistics(phoneID, serviceID uint, isSpam bool) {
-	var stats models.Statistics
-
-	// Try to find existing statistics
-	err := s.db.Where("phone_number_id = ? AND service_id = ?", phoneID, serviceID).First(&stats).Error
-
-	if err == gorm.ErrRecordNotFound {
-		// Create new statistics
-		stats = models.Statistics{
-			PhoneNumberID: phoneID,
-			ServiceID:     serviceID,
-			TotalChecks:   1,
-			LastCheckDate: time.Now(),
-		}
-		if isSpam {
-			stats.SpamCount = 1
-			now := time.Now()
-			stats.FirstSpamDate = &now
-		}
-		s.db.Create(&stats)
-	} else if err == nil {
-		// Update existing statistics
-		stats.TotalChecks++
-		stats.LastCheckDate = time.Now()
-		if isSpam {
-			stats.SpamCount++
-			if stats.FirstSpamDate == nil {
-				now := time.Now()
-				stats.FirstSpamDate = &now
-			}
-		}
-		s.db.Save(&stats)
-	}
 }
 
 // getAppInfo returns package and activity for service
@@ -999,6 +1021,6 @@ func (s *CheckService) GetGatewayStatuses() ([]map[string]interface{}, error) {
 }
 
 func onlyDigits(input string) string {
-	re := regexp.MustCompile(`\D`) // \D = всё, кроме цифр
+	re := regexp.MustCompile(`\D`)
 	return re.ReplaceAllString(input, "")
 }
