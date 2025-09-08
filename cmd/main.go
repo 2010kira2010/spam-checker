@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -11,13 +12,13 @@ import (
 	"spam-checker/internal/config"
 	"spam-checker/internal/database"
 	"spam-checker/internal/handlers"
+	"spam-checker/internal/logger"
 	"spam-checker/internal/middleware"
 	"spam-checker/internal/scheduler"
 	"spam-checker/internal/services"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/gofiber/swagger"
 	"github.com/sirupsen/logrus"
@@ -49,21 +50,36 @@ func main() {
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
-		logrus.Fatalf("Failed to load configuration: %v", err)
+		// Use fmt for initial error as logger might not be initialized
+		fmt.Fprintf(os.Stderr, "Failed to load configuration: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Setup logger
-	setupLogger(cfg.App.LogLevel)
+	// Initialize logger
+	logConfig := logger.Config{
+		Level:      cfg.App.LogLevel,
+		Format:     cfg.App.LogFormat,
+		Output:     cfg.App.LogOutput,
+		TimeFormat: "2006-01-02 15:04:05.000",
+	}
+
+	if err := logger.Initialize(logConfig); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+
+	logger.Info("Starting SpamChecker application")
+	logger.WithField("config", cfg.App).Info("Configuration loaded")
 
 	// Connect to database
 	db, err := database.Connect(cfg.Database)
 	if err != nil {
-		logrus.Fatalf("Failed to connect to database: %v", err)
+		logger.Fatalf("Failed to connect to database: %v", err)
 	}
 
 	// Run migrations
 	if err := database.Migrate(db); err != nil {
-		logrus.Fatalf("Failed to run migrations: %v", err)
+		logger.Fatalf("Failed to run migrations: %v", err)
 	}
 
 	// Initialize services
@@ -91,11 +107,26 @@ func main() {
 	})
 
 	// Middleware
-	app.Use(recover.New())
-	app.Use(logger.New())
+	app.Use(recover.New(recover.Config{
+		EnableStackTrace: true,
+		StackTraceHandler: func(c *fiber.Ctx, e interface{}) {
+			logger.WithFields(logrus.Fields{
+				"panic":      e,
+				"path":       c.Path(),
+				"method":     c.Method(),
+				"request_id": c.Locals(logger.RequestIDKey),
+			}).Error("Panic recovered")
+		},
+	}))
+
+	// Use custom logger middleware instead of fiber's default
+	app.Use(middleware.NewLogger(middleware.LoggerConfig{
+		SkipPaths: []string{"/health", "/metrics"},
+	}))
+
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     "http://localhost:3000",
-		AllowHeaders:     "Origin, Content-Type, Accept, Authorization",
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-Request-ID",
 		AllowMethods:     "GET, POST, PUT, DELETE, OPTIONS, PATCH",
 		AllowCredentials: true,
 	}))
@@ -145,6 +176,7 @@ func main() {
 			"status": "ok",
 			"app":    cfg.App.Name,
 			"env":    cfg.App.Environment,
+			"time":   time.Now().Unix(),
 		})
 	})
 
@@ -172,53 +204,68 @@ func main() {
 		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 		<-sigChan
 
-		logrus.Info("Shutting down server...")
+		logger.Info("Received shutdown signal, starting graceful shutdown...")
+
+		// Stop scheduler first
 		checkScheduler.Stop()
-		if err := app.Shutdown(); err != nil {
-			logrus.Errorf("Server shutdown error: %v", err)
+		logger.Info("Scheduler stopped")
+
+		// Shutdown Fiber with timeout
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := app.ShutdownWithContext(shutdownCtx); err != nil {
+			logger.Errorf("Server shutdown error: %v", err)
+		} else {
+			logger.Info("Server shutdown completed")
+		}
+
+		// Close database connections
+		sqlDB, err := db.DB()
+		if err == nil {
+			sqlDB.Close()
+			logger.Info("Database connections closed")
 		}
 	}()
 
 	// Start server
 	addr := fmt.Sprintf(":%s", cfg.App.Port)
-	logrus.Infof("Starting server on %s", addr)
+	logger.Infof("Starting server on %s", addr)
+
 	if err := app.Listen(addr); err != nil {
-		logrus.Fatalf("Failed to start server: %v", err)
+		logger.Fatalf("Failed to start server: %v", err)
 	}
 }
 
-func setupLogger(level string) {
-	logrus.SetFormatter(&logrus.TextFormatter{
-		FullTimestamp: true,
-	})
-
-	switch level {
-	case "debug":
-		logrus.SetLevel(logrus.DebugLevel)
-	case "info":
-		logrus.SetLevel(logrus.InfoLevel)
-	case "warn":
-		logrus.SetLevel(logrus.WarnLevel)
-	case "error":
-		logrus.SetLevel(logrus.ErrorLevel)
-	default:
-		logrus.SetLevel(logrus.InfoLevel)
-	}
-}
-
+// customErrorHandler handles errors in Fiber
 func customErrorHandler(c *fiber.Ctx, err error) error {
+	// Get request ID from context
+	requestID := c.Locals(logger.RequestIDKey)
+
+	// Default error values
 	code := fiber.StatusInternalServerError
 	message := "Internal Server Error"
 
+	// Check if it's a Fiber error
 	if e, ok := err.(*fiber.Error); ok {
 		code = e.Code
 		message = e.Message
 	}
 
-	logrus.Errorf("Error: %v", err)
+	// Log error with context
+	logger.WithFields(logrus.Fields{
+		"error":      err.Error(),
+		"status":     code,
+		"path":       c.Path(),
+		"method":     c.Method(),
+		"ip":         c.IP(),
+		"request_id": requestID,
+	}).Error("Request error")
 
+	// Return error response
 	return c.Status(code).JSON(fiber.Map{
-		"error": message,
-		"code":  code,
+		"error":      message,
+		"code":       code,
+		"request_id": requestID,
 	})
 }

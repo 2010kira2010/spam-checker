@@ -3,6 +3,7 @@ package scheduler
 import (
 	"fmt"
 	"spam-checker/internal/config"
+	"spam-checker/internal/logger"
 	"spam-checker/internal/models"
 	"spam-checker/internal/services"
 	"time"
@@ -20,6 +21,7 @@ type CheckScheduler struct {
 	db                  *gorm.DB
 	jobs                map[uint]*gocron.Job
 	cfg                 *config.Config
+	log                 *logrus.Entry
 }
 
 func NewCheckScheduler(db *gorm.DB, checkService *services.CheckService, phoneService *services.PhoneService, notificationService *services.NotificationService, cfg *config.Config) *CheckScheduler {
@@ -31,12 +33,16 @@ func NewCheckScheduler(db *gorm.DB, checkService *services.CheckService, phoneSe
 		db:                  db,
 		jobs:                make(map[uint]*gocron.Job),
 		cfg:                 cfg,
+		log:                 logger.WithField("service", "CheckScheduler"),
 	}
 }
 
 // Start starts the scheduler
 func (s *CheckScheduler) Start() {
-	logrus.Info("Starting check scheduler...")
+	log := s.log.WithFields(logrus.Fields{
+		"method": "Start",
+	})
+	log.Info("Starting check scheduler...")
 
 	// Load schedules from database
 	s.loadSchedules()
@@ -48,37 +54,47 @@ func (s *CheckScheduler) Start() {
 	s.scheduler.Every(5).Minutes().Do(func() {
 		adbService := services.NewADBService(s.db, s.cfg)
 		if err := adbService.UpdateAllGatewayStatuses(); err != nil {
-			logrus.Errorf("Failed to update gateway statuses: %v", err)
+			log.Errorf("Failed to update gateway statuses: %v", err)
 		}
 	})
 
-	logrus.Info("Check scheduler started successfully")
+	log.Info("Check scheduler started successfully")
 }
 
 // Stop stops the scheduler
 func (s *CheckScheduler) Stop() {
-	logrus.Info("Stopping check scheduler...")
+	log := s.log.WithFields(logrus.Fields{
+		"method": "Stop",
+	})
+	log.Info("Stopping check scheduler...")
 	s.scheduler.Clear()
-	logrus.Info("Check scheduler stopped")
+	log.Info("Check scheduler stopped")
 }
 
 // loadSchedules loads schedules from database
 func (s *CheckScheduler) loadSchedules() {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "loadSchedules",
+	})
 	var schedules []models.CheckSchedule
 	if err := s.db.Where("is_active = ?", true).Find(&schedules).Error; err != nil {
-		logrus.Errorf("Failed to load schedules: %v", err)
+		log.Errorf("Failed to load schedules: %v", err)
 		return
 	}
 
 	for _, schedule := range schedules {
 		if err := s.AddSchedule(&schedule); err != nil {
-			logrus.Errorf("Failed to add schedule %s: %v", schedule.Name, err)
+			log.Errorf("Failed to add schedule %s: %v", schedule.Name, err)
 		}
 	}
 }
 
 // AddSchedule adds a new schedule
 func (s *CheckScheduler) AddSchedule(schedule *models.CheckSchedule) error {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "AddSchedule",
+	})
+
 	// Remove existing job if any
 	s.RemoveSchedule(schedule.ID)
 
@@ -98,17 +114,21 @@ func (s *CheckScheduler) AddSchedule(schedule *models.CheckSchedule) error {
 	nextRun := job.NextScheduledTime()
 	s.db.Model(schedule).Update("next_run", &nextRun)
 
-	logrus.Infof("Added schedule: %s (%s)", schedule.Name, schedule.CronExpression)
+	log.Infof("Added schedule: %s (%s)", schedule.Name, schedule.CronExpression)
 
 	return nil
 }
 
 // RemoveSchedule removes a schedule
 func (s *CheckScheduler) RemoveSchedule(scheduleID uint) {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "RemoveSchedule",
+	})
+
 	if job, exists := s.jobs[scheduleID]; exists {
 		s.scheduler.Remove(job)
 		delete(s.jobs, scheduleID)
-		logrus.Infof("Removed schedule ID: %d", scheduleID)
+		log.Infof("Removed schedule ID: %d", scheduleID)
 	}
 }
 
@@ -124,27 +144,31 @@ func (s *CheckScheduler) UpdateSchedule(schedule *models.CheckSchedule) error {
 
 // runScheduledCheck runs a scheduled check
 func (s *CheckScheduler) runScheduledCheck(scheduleID uint) {
-	logrus.Infof("Running scheduled check ID: %d", scheduleID)
+	log := s.log.WithFields(logrus.Fields{
+		"method": "runScheduledCheck",
+	})
+
+	log.Infof("Running scheduled check ID: %d", scheduleID)
 
 	// Update last run time
 	now := time.Now()
 	if err := s.db.Model(&models.CheckSchedule{}).Where("id = ?", scheduleID).Update("last_run", &now).Error; err != nil {
-		logrus.Errorf("Failed to update last run time: %v", err)
+		log.Errorf("Failed to update last run time: %v", err)
 	}
 
 	// Get active phones
 	phones, err := s.phoneService.GetActivePhones()
 	if err != nil {
-		logrus.Errorf("Failed to get active phones: %v", err)
+		log.Errorf("Failed to get active phones: %v", err)
 		return
 	}
 
 	if len(phones) == 0 {
-		logrus.Info("No active phones to check")
+		log.Info("No active phones to check")
 		return
 	}
 
-	logrus.Infof("Starting check for %d phones", len(phones))
+	log.Infof("Starting check for %d phones", len(phones))
 
 	// Track results for notification
 	results := make(map[uint][]models.CheckResult)
@@ -153,7 +177,7 @@ func (s *CheckScheduler) runScheduledCheck(scheduleID uint) {
 	// Check each phone
 	for _, phone := range phones {
 		if err := s.checkService.CheckPhoneNumber(phone.ID); err != nil {
-			logrus.Errorf("Failed to check phone %s: %v", phone.Number, err)
+			log.Errorf("Failed to check phone %s: %v", phone.Number, err)
 			continue
 		}
 
@@ -184,11 +208,15 @@ func (s *CheckScheduler) runScheduledCheck(scheduleID uint) {
 		s.db.Model(&models.CheckSchedule{}).Where("id = ?", scheduleID).Update("next_run", &nextRun)
 	}
 
-	logrus.Infof("Scheduled check completed. Checked %d phones, found %d spam", len(phones), spamCount)
+	log.Infof("Scheduled check completed. Checked %d phones, found %d spam", len(phones), spamCount)
 }
 
 // sendNotification sends notification about check results
 func (s *CheckScheduler) sendNotification(spamCount, totalCount int, results map[uint][]models.CheckResult) {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "sendNotification",
+	})
+
 	message := fmt.Sprintf(
 		"🔍 Check Results\n\n"+
 			"Total phones checked: %d\n"+
@@ -219,7 +247,7 @@ func (s *CheckScheduler) sendNotification(spamCount, totalCount int, results map
 
 	// Send to all active notification channels
 	if err := s.notificationService.SendNotification("Check Results", message); err != nil {
-		logrus.Errorf("Failed to send notification: %v", err)
+		log.Errorf("Failed to send notification: %v", err)
 	}
 }
 

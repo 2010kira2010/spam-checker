@@ -3,6 +3,8 @@ package services
 import (
 	"errors"
 	"fmt"
+	"github.com/sirupsen/logrus"
+	"spam-checker/internal/logger"
 	"spam-checker/internal/models"
 
 	"golang.org/x/crypto/bcrypt"
@@ -10,11 +12,15 @@ import (
 )
 
 type UserService struct {
-	db *gorm.DB
+	db  *gorm.DB
+	log *logrus.Entry
 }
 
 func NewUserService(db *gorm.DB) *UserService {
-	return &UserService{db: db}
+	return &UserService{
+		db:  db,
+		log: logger.WithField("service", "UserService"),
+	}
 }
 
 // CreateUser creates a new user

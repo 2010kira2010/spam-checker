@@ -22,6 +22,8 @@ type AppConfig struct {
 	Port        string
 	Environment string
 	LogLevel    string
+	LogFormat   string
+	LogOutput   string
 }
 
 type DatabaseConfig struct {
@@ -72,7 +74,9 @@ func Load() (*Config, error) {
 			Name:        getEnv("APP_NAME", "SpamChecker"),
 			Port:        getEnv("APP_PORT", "8080"),
 			Environment: getEnv("APP_ENV", "development"),
-			LogLevel:    getEnv("LOG_LEVEL", "info"),
+			LogLevel:    getEnv("LOG_LEVEL", "info"),    // debug, info, warn, error
+			LogFormat:   getEnv("LOG_FORMAT", "json"),   // json или text
+			LogOutput:   getEnv("LOG_OUTPUT", "stdout"), // stdout, stderr или путь к файлу
 		},
 		Database: DatabaseConfig{
 			Host:     getEnv("DB_HOST", "localhost"),

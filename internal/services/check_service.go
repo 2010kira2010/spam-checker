@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"spam-checker/internal/config"
+	"spam-checker/internal/logger"
 	"spam-checker/internal/models"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ type CheckService struct {
 	apiService     *APICheckService
 	gatewayLocks   map[uint]*sync.Mutex
 	gatewayLocksMu sync.RWMutex
+	log            *logrus.Entry
 }
 
 // CheckResult for concurrent processing
@@ -58,6 +60,7 @@ func NewCheckService(db *gorm.DB, cfg *config.Config) *CheckService {
 		adbService:   NewADBServiceWithConfig(db, cfg),
 		apiService:   NewAPICheckService(db),
 		gatewayLocks: make(map[uint]*sync.Mutex),
+		log:          logger.WithField("service", "CheckService"),
 	}
 }
 
@@ -102,6 +105,10 @@ func (s *CheckService) unlockGateway(gatewayID uint) {
 
 // CheckPhoneNumber checks a single phone number across all services concurrently
 func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "CheckPhoneNumber",
+	})
+
 	// Get phone number
 	var phone models.PhoneNumber
 	if err := s.db.First(&phone, phoneID).Error; err != nil {
@@ -111,7 +118,7 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 	// Get check mode setting
 	checkMode := s.getCheckMode()
 
-	logrus.Infof("Starting check for phone %s with mode: %s", phone.Number, checkMode)
+	log.Infof("Starting check for phone %s with mode: %s", phone.Number, checkMode)
 
 	// Perform checks based on mode
 	switch checkMode {
@@ -158,6 +165,10 @@ func (s *CheckService) getCheckMode() models.CheckMode {
 
 // checkViaADB checks phone via ADB gateways
 func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "checkViaADB",
+	})
+
 	// Get active gateways
 	gateways, err := s.adbService.GetActiveGateways()
 	if err != nil {
@@ -168,7 +179,7 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 		return fmt.Errorf("no active ADB gateways available")
 	}
 
-	logrus.Infof("Starting ADB check for phone %s across %d gateways", phone.Number, len(gateways))
+	log.Infof("Starting ADB check for phone %s across %d gateways", phone.Number, len(gateways))
 
 	// Create a channel for results
 	resultChan := make(chan ConcurrentCheckResult, len(gateways))
@@ -182,7 +193,7 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 
 			// Try to lock gateway with 30 second timeout
 			if !s.tryLockGateway(gw.ID, 30*time.Second) {
-				logrus.Warnf("Gateway %s is busy, skipping check for phone %s", gw.Name, phone.Number)
+				log.Warnf("Gateway %s is busy, skipping check for phone %s", gw.Name, phone.Number)
 				resultChan <- ConcurrentCheckResult{
 					PhoneID: phone.ID,
 					Gateway: &gw,
@@ -212,7 +223,7 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 
 			if err := s.checkOnGateway(phone, &gw); err != nil {
 				result.Error = err
-				logrus.Errorf("Failed to check phone %s on gateway %s: %v", phone.Number, gw.Name, err)
+				log.Errorf("Failed to check phone %s on gateway %s: %v", phone.Number, gw.Name, err)
 			} else {
 				// Get the created result
 				var checkResult models.CheckResult
@@ -248,7 +259,7 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 		}
 	}
 
-	logrus.Infof("ADB check completed for phone %s: %d successful, %d failed, %d busy",
+	log.Infof("ADB check completed for phone %s: %d successful, %d failed, %d busy",
 		phone.Number, successCount, errorCount, busyCount)
 
 	if successCount == 0 && errorCount > 0 {
@@ -260,6 +271,10 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 
 // checkViaAPI checks phone via API services
 func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "checkViaAPI",
+	})
+
 	// Get active API services
 	apiServices, err := s.apiService.GetActiveAPIServices()
 	if err != nil {
@@ -270,7 +285,7 @@ func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 		return fmt.Errorf("no active API services available")
 	}
 
-	logrus.Infof("Starting API check for phone %s across %d services", phone.Number, len(apiServices))
+	log.Infof("Starting API check for phone %s across %d services", phone.Number, len(apiServices))
 
 	// Create a channel for results
 	resultChan := make(chan APICheckResult, len(apiServices))
@@ -303,7 +318,7 @@ func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 			checkResult, err := s.apiService.CheckPhoneViaAPI(phone, &api)
 			if err != nil {
 				result.Error = err
-				logrus.Errorf("Failed to check phone %s via API %s: %v", phone.Number, api.Name, err)
+				log.Errorf("Failed to check phone %s via API %s: %v", phone.Number, api.Name, err)
 			} else {
 				result.Result = checkResult
 				// Update statistics
@@ -331,7 +346,7 @@ func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 		}
 	}
 
-	logrus.Infof("API check completed for phone %s: %d successful, %d failed",
+	log.Infof("API check completed for phone %s: %d successful, %d failed",
 		phone.Number, successCount, errorCount)
 
 	if successCount == 0 && errorCount > 0 {
@@ -343,13 +358,17 @@ func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 
 // CheckAllPhones checks all active phone numbers with concurrent processing
 func (s *CheckService) CheckAllPhones() error {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "CheckAllPhones",
+	})
+
 	phones, err := NewPhoneService(s.db).GetActivePhones()
 	if err != nil {
 		return fmt.Errorf("failed to get active phones: %w", err)
 	}
 
 	if len(phones) == 0 {
-		logrus.Info("No active phones to check")
+		log.Info("No active phones to check")
 		return nil
 	}
 
@@ -361,7 +380,7 @@ func (s *CheckService) CheckAllPhones() error {
 		}
 	}
 
-	logrus.Infof("Starting check for %d phones with max %d concurrent checks", len(phones), maxConcurrent)
+	log.Infof("Starting check for %d phones with max %d concurrent checks", len(phones), maxConcurrent)
 
 	// Create semaphore channel to limit concurrent phone checks
 	sem := make(chan struct{}, maxConcurrent)
@@ -377,7 +396,7 @@ func (s *CheckService) CheckAllPhones() error {
 			defer func() { <-sem }()
 
 			if err := s.CheckPhoneNumber(p.ID); err != nil {
-				logrus.Errorf("Failed to check phone %s: %v", p.Number, err)
+				log.Errorf("Failed to check phone %s: %v", p.Number, err)
 			}
 
 			// Small delay between phone checks to avoid overwhelming the system
@@ -386,20 +405,24 @@ func (s *CheckService) CheckAllPhones() error {
 	}
 
 	wg.Wait()
-	logrus.Info("All phone checks completed")
+	log.Info("All phone checks completed")
 
 	return nil
 }
 
 // checkOnGateway checks phone on specific gateway
 func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models.ADBGateway) error {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "checkOnGateway",
+	})
+
 	// Get service info
 	var service models.SpamService
 	if err := s.db.Where("code = ?", gateway.ServiceCode).First(&service).Error; err != nil {
 		return fmt.Errorf("service not found: %w", err)
 	}
 
-	logrus.Infof("Checking %s on %s (gateway: %s)", phone.Number, service.Name, gateway.Name)
+	log.Infof("Checking %s on %s (gateway: %s)", phone.Number, service.Name, gateway.Name)
 
 	// Update gateway status to indicate it's busy
 	s.db.Model(gateway).Update("status", "checking")
@@ -413,13 +436,13 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	if appPackage != "" && appActivity != "" {
 		// Try to start the app (it may already be running)
 		if err := s.adbService.StartApp(gateway.ID, appPackage, appActivity); err != nil {
-			logrus.Warnf("Failed to start app (it may already be running): %v", err)
+			log.Warnf("Failed to start app (it may already be running): %v", err)
 		}
 		time.Sleep(2 * time.Second)
 	}
 
 	// Simulate incoming call
-	logrus.Infof("Simulating incoming call from %s", phone.Number)
+	log.Infof("Simulating incoming call from %s", phone.Number)
 	if err := s.adbService.SimulateIncomingCall(gateway.ID, phone.Number); err != nil {
 		return fmt.Errorf("failed to simulate incoming call: %w", err)
 	}
@@ -430,14 +453,14 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	// Take screenshot
 	screenshot, err := s.adbService.TakeScreenshot(gateway.ID)
 	if err != nil {
-		logrus.Errorf("Failed to take screenshot: %v", err)
+		log.Errorf("Failed to take screenshot: %v", err)
 		// Continue with empty screenshot
 		screenshot = []byte{}
 	}
 
 	// End the call
 	if err := s.adbService.EndCall(gateway.ID, onlyDigits(phone.Number)); err != nil {
-		logrus.Warnf("Failed to end call: %v", err)
+		log.Warnf("Failed to end call: %v", err)
 	}
 
 	// Save screenshot if we got one
@@ -445,7 +468,7 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	if len(screenshot) > 0 {
 		screenshotPath, err = s.saveScreenshot(screenshot, phone.Number, service.Code)
 		if err != nil {
-			logrus.Errorf("Failed to save screenshot: %v", err)
+			log.Errorf("Failed to save screenshot: %v", err)
 			screenshotPath = ""
 		}
 	}
@@ -455,7 +478,7 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	if screenshotPath != "" {
 		ocrText, err = s.performOCR(screenshotPath)
 		if err != nil {
-			logrus.Errorf("Failed to perform OCR: %v", err)
+			log.Errorf("Failed to perform OCR: %v", err)
 			ocrText = ""
 		}
 	}
@@ -481,7 +504,7 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 	// Update statistics
 	s.updateStatistics(phone.ID, service.ID, isSpam)
 
-	logrus.Infof("Check completed for %s on %s: isSpam=%v, keywords=%v",
+	log.Infof("Check completed for %s on %s: isSpam=%v, keywords=%v",
 		phone.Number, service.Name, isSpam, foundKeywords)
 
 	return nil
@@ -489,6 +512,10 @@ func (s *CheckService) checkOnGateway(phone *models.PhoneNumber, gateway *models
 
 // CheckPhoneRealtime checks phone number in real-time with concurrent processing
 func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interface{}, error) {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "CheckPhoneRealtime",
+	})
+
 	// Normalize phone number
 	phoneNumber = NewPhoneService(s.db).normalizePhoneNumber(phoneNumber)
 
@@ -526,13 +553,13 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 				}
 				results["results"] = serviceResults
 
-				logrus.Infof("Returning cached results for phone %s", phoneNumber)
+				log.Infof("Returning cached results for phone %s", phoneNumber)
 				return results, nil
 			}
 		}
 
 		// Results are old or don't exist - perform new check
-		logrus.Infof("Phone %s exists but results are old, performing new check", phoneNumber)
+		log.Infof("Phone %s exists but results are old, performing new check", phoneNumber)
 		return s.performRealtimeCheck(&existingPhone, true) // true = high priority
 	}
 
@@ -564,6 +591,10 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 
 // performRealtimeCheck performs actual realtime check for a phone
 func (s *CheckService) performRealtimeCheck(phone *models.PhoneNumber, highPriority bool) (map[string]interface{}, error) {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "performRealtimeCheck",
+	})
+
 	results := make(map[string]interface{})
 	results["phone_number"] = phone.Number
 	results["checked_at"] = time.Now()
@@ -596,7 +627,7 @@ func (s *CheckService) performRealtimeCheck(phone *models.PhoneNumber, highPrior
 
 				// Try to lock gateway with timeout
 				if !s.tryLockGateway(gw.ID, timeout) {
-					logrus.Warnf("Gateway %s is busy, skipping realtime check", gw.Name)
+					log.Warnf("Gateway %s is busy, skipping realtime check", gw.Name)
 					resultChan <- map[string]interface{}{
 						"service": gw.ServiceCode,
 						"error":   "Gateway is busy",
@@ -710,6 +741,10 @@ func (s *CheckService) performRealtimeCheck(phone *models.PhoneNumber, highPrior
 
 // CheckPhoneNumbersInBatch checks multiple phone numbers concurrently
 func (s *CheckService) CheckPhoneNumbersInBatch(phoneIDs []uint) error {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "CheckPhoneNumbersInBatch",
+	})
+
 	if len(phoneIDs) == 0 {
 		return nil
 	}
@@ -722,7 +757,7 @@ func (s *CheckService) CheckPhoneNumbersInBatch(phoneIDs []uint) error {
 		}
 	}
 
-	logrus.Infof("Starting batch check for %d phones with max %d concurrent", len(phoneIDs), maxConcurrent)
+	log.Infof("Starting batch check for %d phones with max %d concurrent", len(phoneIDs), maxConcurrent)
 
 	// Create semaphore channel
 	sem := make(chan struct{}, maxConcurrent)
@@ -812,6 +847,10 @@ func (s *CheckService) performOCR(imagePath string) (string, error) {
 
 // checkForSpamKeywords checks if text contains spam keywords
 func (s *CheckService) checkForSpamKeywords(text string, serviceID uint) (bool, []string) {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "checkForSpamKeywords",
+	})
+
 	text = strings.ToLower(text)
 	var foundKeywords []string
 
@@ -821,7 +860,7 @@ func (s *CheckService) checkForSpamKeywords(text string, serviceID uint) (bool, 
 	query = query.Where("service_id IS NULL OR service_id = ?", serviceID)
 
 	if err := query.Find(&keywords).Error; err != nil {
-		logrus.Errorf("Failed to get spam keywords: %v", err)
+		log.Errorf("Failed to get spam keywords: %v", err)
 		return false, foundKeywords
 	}
 

@@ -3,18 +3,21 @@ package database
 import (
 	"fmt"
 	"spam-checker/internal/config"
+	"spam-checker/internal/logger"
 	"spam-checker/internal/models"
 
 	"github.com/sirupsen/logrus"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // Connect establishes database connection
 func Connect(cfg config.DatabaseConfig) (*gorm.DB, error) {
+	// Use custom GORM logger
 	db, err := gorm.Open(postgres.Open(cfg.DSN()), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Info),
+		Logger:                 logger.NewGormLogger(),
+		SkipDefaultTransaction: true,
+		PrepareStmt:            true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
@@ -29,13 +32,13 @@ func Connect(cfg config.DatabaseConfig) (*gorm.DB, error) {
 	sqlDB.SetMaxIdleConns(10)
 	sqlDB.SetMaxOpenConns(100)
 
-	logrus.Info("Successfully connected to database")
+	logger.Info("Successfully connected to database")
 	return db, nil
 }
 
 // Migrate runs database migrations
 func Migrate(db *gorm.DB) error {
-	logrus.Info("Running database migrations...")
+	logger.Info("Running database migrations...")
 
 	err := db.AutoMigrate(
 		&models.User{},
@@ -59,7 +62,7 @@ func Migrate(db *gorm.DB) error {
 		return fmt.Errorf("failed to seed initial data: %w", err)
 	}
 
-	logrus.Info("Database migrations completed successfully")
+	logger.Info("Database migrations completed successfully")
 	return nil
 }
 
@@ -79,7 +82,9 @@ func seedInitialData(db *gorm.DB) error {
 				if err := db.Create(&service).Error; err != nil {
 					return fmt.Errorf("failed to create service %s: %w", service.Name, err)
 				}
-				logrus.Infof("Created spam service: %s", service.Name)
+				logger.WithFields(logrus.Fields{
+					"service": service.Name,
+				}).Info("Created spam service")
 			} else {
 				return fmt.Errorf("failed to check service %s: %w", service.Name, err)
 			}
@@ -101,7 +106,10 @@ func seedInitialData(db *gorm.DB) error {
 			if err := db.Create(&adminUser).Error; err != nil {
 				return fmt.Errorf("failed to create admin user: %w", err)
 			}
-			logrus.Info("Created default admin user (email: admin@spamchecker.com, password: admin123)")
+			logger.WithFields(logrus.Fields{
+				"username": adminUser.Username,
+				"email":    adminUser.Email,
+			}).Info("Created default admin user (password: admin123)")
 		}
 	}
 
@@ -122,7 +130,11 @@ func seedInitialData(db *gorm.DB) error {
 				if err := db.Create(&setting).Error; err != nil {
 					return fmt.Errorf("failed to create setting %s: %w", setting.Key, err)
 				}
-				logrus.Infof("Created default setting: %s = %s", setting.Key, setting.Value)
+				logger.WithFields(logrus.Fields{
+					"key":      setting.Key,
+					"value":    setting.Value,
+					"category": setting.Category,
+				}).Debug("Created default setting")
 			}
 		}
 	}
@@ -143,6 +155,7 @@ func seedInitialData(db *gorm.DB) error {
 		{Keyword: "telemarketing", IsActive: true},
 	}
 
+	keywordsCreated := 0
 	for _, keyword := range defaultKeywords {
 		var existing models.SpamKeyword
 		if err := db.Where("keyword = ?", keyword.Keyword).First(&existing).Error; err != nil {
@@ -150,8 +163,15 @@ func seedInitialData(db *gorm.DB) error {
 				if err := db.Create(&keyword).Error; err != nil {
 					return fmt.Errorf("failed to create keyword %s: %w", keyword.Keyword, err)
 				}
+				keywordsCreated++
 			}
 		}
+	}
+
+	if keywordsCreated > 0 {
+		logger.WithFields(logrus.Fields{
+			"count": keywordsCreated,
+		}).Info("Created default spam keywords")
 	}
 
 	return nil

@@ -2,6 +2,8 @@ package services
 
 import (
 	"fmt"
+	"github.com/sirupsen/logrus"
+	"spam-checker/internal/logger"
 	"spam-checker/internal/models"
 	"time"
 
@@ -9,11 +11,15 @@ import (
 )
 
 type StatisticsService struct {
-	db *gorm.DB
+	db  *gorm.DB
+	log *logrus.Entry
 }
 
 func NewStatisticsService(db *gorm.DB) *StatisticsService {
-	return &StatisticsService{db: db}
+	return &StatisticsService{
+		db:  db,
+		log: logger.WithField("service", "StatisticsService"),
+	}
 }
 
 // GetOverviewStats gets general overview statistics

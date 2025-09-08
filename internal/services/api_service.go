@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"spam-checker/internal/logger"
 	"spam-checker/internal/models"
 	"strings"
 	"time"
@@ -15,11 +16,15 @@ import (
 )
 
 type APICheckService struct {
-	db *gorm.DB
+	db  *gorm.DB
+	log *logrus.Entry
 }
 
 func NewAPICheckService(db *gorm.DB) *APICheckService {
-	return &APICheckService{db: db}
+	return &APICheckService{
+		db:  db,
+		log: logger.WithField("service", "APICheckService"),
+	}
 }
 
 // CreateAPIService creates a new API service
@@ -93,13 +98,17 @@ func (s *APICheckService) DeleteAPIService(id uint) error {
 
 // CheckPhoneViaAPI checks phone number using external API
 func (s *APICheckService) CheckPhoneViaAPI(phone *models.PhoneNumber, apiService *models.APIService) (*models.CheckResult, error) {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "CheckPhoneViaAPI",
+	})
+
 	// Get service info
 	var service models.SpamService
 	if err := s.db.Where("code = ?", apiService.ServiceCode).First(&service).Error; err != nil {
 		return nil, fmt.Errorf("spam service not found: %w", err)
 	}
 
-	logrus.Infof("Checking %s via API service %s", phone.Number, apiService.Name)
+	log.Infof("Checking %s via API service %s", phone.Number, apiService.Name)
 
 	// Replace placeholders in URL
 	url := s.replacePhonePlaceholder(apiService.APIURL, phone.Number)
@@ -166,7 +175,7 @@ func (s *APICheckService) CheckPhoneViaAPI(phone *models.PhoneNumber, apiService
 		return nil, fmt.Errorf("failed to save check result: %w", err)
 	}
 
-	logrus.Infof("API check completed for %s on %s: isSpam=%v, keywords=%v",
+	log.Infof("API check completed for %s on %s: isSpam=%v, keywords=%v",
 		phone.Number, apiService.Name, isSpam, foundKeywords)
 
 	return result, nil
@@ -225,6 +234,10 @@ func (s *APICheckService) replacePhonePlaceholder(str string, phoneNumber string
 
 // analyzeAPIResponse analyzes API response for spam indicators
 func (s *APICheckService) analyzeAPIResponse(response string, serviceID uint) (bool, []string) {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "analyzeAPIResponse",
+	})
+
 	responseText := strings.ToLower(response)
 	var foundKeywords []string
 
@@ -234,7 +247,7 @@ func (s *APICheckService) analyzeAPIResponse(response string, serviceID uint) (b
 	query = query.Where("service_id IS NULL OR service_id = ?", serviceID)
 
 	if err := query.Find(&keywords).Error; err != nil {
-		logrus.Errorf("Failed to get spam keywords: %v", err)
+		log.Errorf("Failed to get spam keywords: %v", err)
 		return false, foundKeywords
 	}
 

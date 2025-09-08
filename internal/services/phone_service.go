@@ -4,7 +4,9 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"github.com/sirupsen/logrus"
 	"io"
+	"spam-checker/internal/logger"
 	"spam-checker/internal/models"
 	"strings"
 
@@ -12,11 +14,15 @@ import (
 )
 
 type PhoneService struct {
-	db *gorm.DB
+	db  *gorm.DB
+	log *logrus.Entry
 }
 
 func NewPhoneService(db *gorm.DB) *PhoneService {
-	return &PhoneService{db: db}
+	return &PhoneService{
+		db:  db,
+		log: logger.WithField("service", "PhoneService"),
+	}
 }
 
 // CreatePhone creates a new phone number

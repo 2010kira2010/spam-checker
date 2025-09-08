@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/smtp"
+	"spam-checker/internal/logger"
 	"spam-checker/internal/models"
 	"strings"
 
@@ -14,7 +15,8 @@ import (
 )
 
 type NotificationService struct {
-	db *gorm.DB
+	db  *gorm.DB
+	log *logrus.Entry
 }
 
 type TelegramConfig struct {
@@ -32,11 +34,18 @@ type EmailConfig struct {
 }
 
 func NewNotificationService(db *gorm.DB) *NotificationService {
-	return &NotificationService{db: db}
+	return &NotificationService{
+		db:  db,
+		log: logger.WithField("service", "NotificationService"),
+	}
 }
 
 // SendNotification sends notification to all active channels
 func (s *NotificationService) SendNotification(subject, message string) error {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "SendNotification",
+	})
+
 	var notifications []models.Notification
 	if err := s.db.Where("is_active = ?", true).Find(&notifications).Error; err != nil {
 		return fmt.Errorf("failed to get active notifications: %w", err)
@@ -51,15 +60,15 @@ func (s *NotificationService) SendNotification(subject, message string) error {
 		case "email":
 			err = s.sendEmailNotification(notification.Config, subject, message)
 		default:
-			logrus.Warnf("Unknown notification type: %s", notification.Type)
+			log.Warnf("Unknown notification type: %s", notification.Type)
 			continue
 		}
 
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", notification.Type, err))
-			logrus.Errorf("Failed to send %s notification: %v", notification.Type, err)
+			log.Errorf("Failed to send %s notification: %v", notification.Type, err)
 		} else {
-			logrus.Infof("Sent %s notification successfully", notification.Type)
+			log.Infof("Sent %s notification successfully", notification.Type)
 		}
 	}
 

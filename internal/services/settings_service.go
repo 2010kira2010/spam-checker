@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/sirupsen/logrus"
+	"spam-checker/internal/logger"
 	"spam-checker/internal/models"
 	"strconv"
 
@@ -11,11 +13,15 @@ import (
 )
 
 type SettingsService struct {
-	db *gorm.DB
+	db  *gorm.DB
+	log *logrus.Entry
 }
 
 func NewSettingsService(db *gorm.DB) *SettingsService {
-	return &SettingsService{db: db}
+	return &SettingsService{
+		db:  db,
+		log: logger.WithField("service", "SettingsService"),
+	}
 }
 
 // GetSetting gets a single setting by key
