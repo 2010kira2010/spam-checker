@@ -189,6 +189,10 @@ export const en = {
         saveSettings: 'Save Settings',
         settingsSaved: 'Settings saved successfully',
         // General
+        checkMode: 'Check Mode',
+        checkModeADBonly: 'ADB Gateways Only - Check using Android emulators',
+        checkModeAPIonly: 'API Services Only - Check using external APIs',
+        checkModeBoth: 'Both - Check using both ADB gateways and API services',
         checkInterval: 'Check Interval (minutes)',
         checkIntervalHelp: 'How often to check all active phones',
         maxConcurrentChecks: 'Max Concurrent Checks',

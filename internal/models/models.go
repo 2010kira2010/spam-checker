@@ -197,17 +197,19 @@ type ADBGateway struct {
 
 // APIService represents external API service for spam checking
 type APIService struct {
-	ID          uint      `gorm:"primaryKey" json:"id"`
-	Name        string    `gorm:"unique;not null" json:"name"`
-	ServiceCode string    `gorm:"not null" json:"service_code"`
-	APIURL      string    `gorm:"not null" json:"api_url"`
-	Headers     string    `gorm:"type:jsonb" json:"headers"`
-	Method      string    `gorm:"default:GET" json:"method"`
-	RequestBody string    `json:"request_body,omitempty"`
-	IsActive    bool      `gorm:"default:true" json:"is_active"`
-	Timeout     int       `gorm:"default:30" json:"timeout"` // seconds
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID           uint      `gorm:"primaryKey" json:"id"`
+	Name         string    `gorm:"unique;not null" json:"name"`
+	ServiceCode  string    `gorm:"not null" json:"service_code"`
+	APIURL       string    `gorm:"not null" json:"api_url"`
+	Headers      string    `gorm:"type:jsonb" json:"headers"`
+	Method       string    `gorm:"default:GET" json:"method"`
+	RequestBody  string    `json:"request_body,omitempty"`
+	IsActive     bool      `gorm:"default:true" json:"is_active"`
+	Timeout      int       `gorm:"default:30" json:"timeout"` // seconds
+	KeywordPaths string    `json:"keyword_paths,omitempty"`
+	ResponsePath string    `json:"response_path,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // SystemSettings represents system configuration

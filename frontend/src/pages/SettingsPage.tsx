@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from 'react';
 import { observer } from 'mobx-react-lite';
 import { useTranslation } from 'react-i18next';
@@ -39,6 +38,8 @@ import {
     SvgIcon,
     SvgIconProps,
     LinearProgress,
+    Collapse,
+    InputAdornment,
 } from '@mui/material';
 import {
     Settings as SettingsIcon,
@@ -61,6 +62,13 @@ import {
     Api,
     PlayArrow,
     Code,
+    ExpandMore,
+    ExpandLess,
+    ContentCopy,
+    Phone,
+    CheckCircle as CheckCircleIcon,
+    Error as ErrorIcon,
+    Info as InfoIcon,
 } from '@mui/icons-material';
 import { useSnackbar } from 'notistack';
 import axios from 'axios';
@@ -101,6 +109,8 @@ interface APIService {
     request_body?: string;
     timeout: number;
     is_active: boolean;
+    response_path?: string;
+    keyword_paths?: string;
 }
 
 interface SpamKeyword {
@@ -185,9 +195,10 @@ const SettingsPage: React.FC = observer(() => {
     const [editingApiService, setEditingApiService] = useState<APIService | null>(null);
     const [testingApiService, setTestingApiService] = useState<number | null>(null);
     const [testPhoneNumber, setTestPhoneNumber] = useState('');
-    const [testResults, setTestResults] = useState<any>(null);
+    const [testResults, setTestResults] = useState<Record<number, any>>({});
     const [headersEditorOpen, setHeadersEditorOpen] = useState(false);
     const [editingHeaders, setEditingHeaders] = useState('');
+    const [expandedApiService, setExpandedApiService] = useState<number | null>(null);
 
     // Keywords
     const [keywords, setKeywords] = useState<SpamKeyword[]>([]);
@@ -256,13 +267,15 @@ const SettingsPage: React.FC = observer(() => {
         setEditingApiService({
             id: 0,
             name: '',
-            service_code: 'custom',
+            service_code: 'custom_api',
             api_url: '',
             headers: '{}',
             method: 'GET',
             request_body: '',
             timeout: 30,
             is_active: true,
+            response_path: '',
+            keyword_paths: '',
         });
         setApiDialogOpen(true);
     };
@@ -275,17 +288,45 @@ const SettingsPage: React.FC = observer(() => {
     const handleSaveApiService = async () => {
         if (!editingApiService) return;
 
-        try {
-            // Validate headers JSON
-            if (editingApiService.headers) {
-                try {
-                    JSON.parse(editingApiService.headers);
-                } catch {
-                    enqueueSnackbar('Invalid headers JSON format', { variant: 'error' });
-                    return;
-                }
-            }
+        // Validation
+        if (!editingApiService.name.trim()) {
+            enqueueSnackbar('Name is required', { variant: 'error' });
+            return;
+        }
 
+        if (!editingApiService.api_url.trim()) {
+            enqueueSnackbar('API URL is required', { variant: 'error' });
+            return;
+        }
+
+        try {
+            new URL(editingApiService.api_url);
+        } catch {
+            enqueueSnackbar('Invalid API URL format', { variant: 'error' });
+            return;
+        }
+
+        // Validate headers JSON
+        if (editingApiService.headers) {
+            try {
+                JSON.parse(editingApiService.headers);
+            } catch {
+                enqueueSnackbar('Invalid headers JSON format', { variant: 'error' });
+                return;
+            }
+        }
+
+        // Validate request body JSON for non-GET methods
+        if (editingApiService.method !== 'GET' && editingApiService.request_body) {
+            try {
+                JSON.parse(editingApiService.request_body);
+            } catch {
+                enqueueSnackbar('Invalid request body JSON format', { variant: 'error' });
+                return;
+            }
+        }
+
+        try {
             if (editingApiService.id === 0) {
                 const res = await axios.post('/api-services', editingApiService);
                 setApiServices([...apiServices, res.data]);
@@ -295,8 +336,8 @@ const SettingsPage: React.FC = observer(() => {
             }
             setApiDialogOpen(false);
             enqueueSnackbar(t('common.success'), { variant: 'success' });
-        } catch (error) {
-            enqueueSnackbar(t('errors.saveFailed'), { variant: 'error' });
+        } catch (error: any) {
+            enqueueSnackbar(error.response?.data?.error || t('errors.saveFailed'), { variant: 'error' });
         }
     };
 
@@ -319,17 +360,17 @@ const SettingsPage: React.FC = observer(() => {
         }
 
         setTestingApiService(id);
-        setTestResults(null);
+        setTestResults(prev => ({ ...prev, [id]: null }));
 
         try {
             const res = await axios.post(`/api-services/${id}/test`, {
                 phone_number: testPhoneNumber,
             });
-            setTestResults(res.data);
+            setTestResults(prev => ({ ...prev, [id]: res.data }));
             enqueueSnackbar('Test completed', { variant: 'success' });
         } catch (error: any) {
             enqueueSnackbar(error.response?.data?.error || 'Test failed', { variant: 'error' });
-            setTestResults({ error: error.response?.data?.error || 'Test failed' });
+            setTestResults(prev => ({ ...prev, [id]: { error: error.response?.data?.error || 'Test failed' } }));
         } finally {
             setTestingApiService(null);
         }
@@ -369,14 +410,44 @@ const SettingsPage: React.FC = observer(() => {
         }
     };
 
-    const exampleHeaders = {
-        "App-Build-Number": "257",
-        "App-Version-Name": "25.7",
-        "Accept-Language": "ru",
-        "OS-Name": "iOS",
-        "OS-Version": "18.5",
-        "X-Src": "ru.yandex.mobile.search",
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X)",
+    const handleCopyExample = (example: any) => {
+        const formatted = JSON.stringify(example, null, 2);
+        navigator.clipboard.writeText(formatted);
+        enqueueSnackbar('Copied to clipboard', { variant: 'success' });
+    };
+
+    const exampleConfigs = {
+        yandex: {
+            headers: {
+                "App-Build-Number": "257",
+                "App-Version-Name": "25.7",
+                "Accept-Language": "ru",
+                "OS-Name": "iOS",
+                "OS-Version": "18.5",
+                "X-Src": "ru.yandex.mobile.search",
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X)",
+            },
+            response_path: "$.items[?(@.id=='caller-id')].snippet",
+            keyword_paths: "$.items[*].snippet"
+        },
+        truecaller: {
+            headers: {
+                "Accept": "application/json",
+                "Authorization": "Bearer YOUR_API_KEY",
+                "User-Agent": "Truecaller/12.0.0"
+            },
+            response_path: "$.data.name",
+            keyword_paths: "$.data.tags[*]"
+        },
+        getcontact: {
+            headers: {
+                "X-Api-Version": "2.0",
+                "X-Client-Version": "4.9.1",
+                "Accept": "application/json"
+            },
+            response_path: "$.result.display_name",
+            keyword_paths: "$.result.tags[*].tag"
+        }
     };
 
     const handleSaveGateway = async () => {
@@ -741,7 +812,7 @@ const SettingsPage: React.FC = observer(() => {
                         <TabPanel value={tabValue} index={0}>
                             <Grid container spacing={3}>
                                 <Grid item xs={12}>
-                                    <Typography variant="h6" sx={{ mb: 2 }}>Check Mode</Typography>
+                                    <Typography variant="h6" sx={{ mb: 2 }}>{t('settings.checkMode')}</Typography>
                                     <FormControl component="fieldset">
                                         <RadioGroup
                                             value={generalSettings.check_mode}
@@ -750,17 +821,17 @@ const SettingsPage: React.FC = observer(() => {
                                             <FormControlLabel
                                                 value="adb_only"
                                                 control={<Radio />}
-                                                label="ADB Gateways Only - Check using Android emulators"
+                                                label={t('settings.checkModeADBonly')}
                                             />
                                             <FormControlLabel
                                                 value="api_only"
                                                 control={<Radio />}
-                                                label="API Services Only - Check using external APIs"
+                                                label={t('settings.checkModeAPIonly')}
                                             />
                                             <FormControlLabel
                                                 value="both"
                                                 control={<Radio />}
-                                                label="Both - Check using both ADB gateways and API services"
+                                                label={t('settings.checkModeBoth')}
                                             />
                                         </RadioGroup>
                                     </FormControl>
@@ -885,11 +956,9 @@ const SettingsPage: React.FC = observer(() => {
                                 </Button>
                             </Box>
 
-                            {testPhoneNumber === '' && (
-                                <Alert severity="info" sx={{ mb: 2 }}>
-                                    Enter a test phone number to test API services instantly
-                                </Alert>
-                            )}
+                            <Alert severity="info" sx={{ mb: 3 }}>
+                                Configure external APIs to check phone numbers. Enter a test phone number below to test services instantly.
+                            </Alert>
 
                             <Box sx={{ mb: 3 }}>
                                 <TextField
@@ -899,124 +968,212 @@ const SettingsPage: React.FC = observer(() => {
                                     value={testPhoneNumber}
                                     onChange={(e) => setTestPhoneNumber(e.target.value)}
                                     helperText="Enter a phone number to test API services"
+                                    InputProps={{
+                                        startAdornment: (
+                                            <InputAdornment position="start">
+                                                <Phone />
+                                            </InputAdornment>
+                                        ),
+                                    }}
                                 />
                             </Box>
 
                             <List>
                                 {apiServices.map((service) => (
-                                    <Paper key={service.id} sx={{ mb: 2, p: 2 }}>
-                                        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flex: 1 }}>
-                                                <Api color={service.is_active ? 'success' : 'disabled'} />
-                                                <Box sx={{ flex: 1 }}>
-                                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                                        <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
-                                                            {service.name}
-                                                        </Typography>
-                                                        <Chip
-                                                            label={service.method}
-                                                            size="small"
-                                                            color="primary"
-                                                            variant="outlined"
-                                                        />
-                                                        <Chip
-                                                            label={service.service_code}
-                                                            size="small"
-                                                            variant="outlined"
-                                                        />
-                                                        <Chip
-                                                            label={service.is_active ? 'Active' : 'Inactive'}
-                                                            size="small"
-                                                            color={service.is_active ? 'success' : 'default'}
-                                                        />
-                                                    </Box>
-                                                    <Typography variant="body2" color="text.secondary" sx={{
-                                                        whiteSpace: 'nowrap',
-                                                        overflow: 'hidden',
-                                                        textOverflow: 'ellipsis',
-                                                        maxWidth: '600px'
-                                                    }}>
-                                                        {service.api_url}
-                                                    </Typography>
-                                                    <Typography variant="caption" color="text.secondary">
-                                                        Timeout: {service.timeout}s
-                                                    </Typography>
-                                                </Box>
-                                            </Box>
-                                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                                <Tooltip title="Test API">
-                                                    <IconButton
-                                                        size="small"
-                                                        onClick={() => handleTestApiService(service.id)}
-                                                        disabled={testingApiService === service.id || !testPhoneNumber}
-                                                    >
-                                                        {testingApiService === service.id ? <CircularProgress size={20} /> : <PlayArrow />}
-                                                    </IconButton>
-                                                </Tooltip>
-                                                <Tooltip title="Toggle Active">
-                                                    <IconButton
-                                                        size="small"
-                                                        onClick={() => handleToggleApiService(service)}
-                                                    >
-                                                        <Switch checked={service.is_active} />
-                                                    </IconButton>
-                                                </Tooltip>
-                                                <IconButton size="small" onClick={() => handleEditApiService(service)}>
-                                                    <Edit />
-                                                </IconButton>
-                                                <IconButton size="small" color="error" onClick={() => handleDeleteApiService(service.id)}>
-                                                    <Delete />
-                                                </IconButton>
-                                            </Box>
-                                        </Box>
-                                        {testResults && testingApiService === null && testResults.url === service.api_url && (
-                                            <Box sx={{ mt: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
-                                                <Typography variant="subtitle2" sx={{ mb: 1 }}>Test Results:</Typography>
-                                                {testResults.error ? (
-                                                    <Alert severity="error">{testResults.error}</Alert>
-                                                ) : (
-                                                    <>
-                                                        <Box sx={{ display: 'flex', gap: 2, mb: 1 }}>
+                                    <Paper key={service.id} sx={{ mb: 2 }}>
+                                        <Box sx={{ p: 2 }}>
+                                            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flex: 1 }}>
+                                                    <Api color={service.is_active ? 'success' : 'disabled'} />
+                                                    <Box sx={{ flex: 1 }}>
+                                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                                            <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+                                                                {service.name}
+                                                            </Typography>
                                                             <Chip
-                                                                label={`Status: ${testResults.status_code}`}
-                                                                color={testResults.status_code === 200 ? 'success' : 'error'}
+                                                                label={service.method}
                                                                 size="small"
+                                                                color="primary"
+                                                                variant="outlined"
                                                             />
                                                             <Chip
-                                                                label={`Response Time: ${testResults.response_time}ms`}
+                                                                label={service.service_code}
                                                                 size="small"
+                                                                variant="outlined"
                                                             />
                                                             <Chip
-                                                                label={testResults.is_spam ? 'Spam Detected' : 'Clean'}
-                                                                color={testResults.is_spam ? 'error' : 'success'}
+                                                                label={service.is_active ? 'Active' : 'Inactive'}
                                                                 size="small"
+                                                                color={service.is_active ? 'success' : 'default'}
                                                             />
                                                         </Box>
-                                                        {testResults.keywords && testResults.keywords.length > 0 && (
-                                                            <Box sx={{ mb: 1 }}>
-                                                                <Typography variant="caption">Keywords found: </Typography>
-                                                                {testResults.keywords.map((kw: string, idx: number) => (
-                                                                    <Chip key={idx} label={kw} size="small" sx={{ ml: 0.5 }} />
-                                                                ))}
-                                                            </Box>
-                                                        )}
-                                                        <pre style={{
-                                                            margin: 0,
-                                                            fontSize: '12px',
-                                                            whiteSpace: 'pre-wrap',
-                                                            wordBreak: 'break-word',
-                                                            maxHeight: '200px',
-                                                            overflow: 'auto'
+                                                        <Typography variant="body2" color="text.secondary" sx={{
+                                                            whiteSpace: 'nowrap',
+                                                            overflow: 'hidden',
+                                                            textOverflow: 'ellipsis',
+                                                            maxWidth: '600px'
                                                         }}>
-                                                            {testResults.response}
-                                                        </pre>
-                                                    </>
-                                                )}
+                                                            {service.api_url}
+                                                        </Typography>
+                                                        <Typography variant="caption" color="text.secondary">
+                                                            Timeout: {service.timeout}s
+                                                        </Typography>
+                                                    </Box>
+                                                </Box>
+                                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                                    <Tooltip title="Expand Details">
+                                                        <IconButton
+                                                            size="small"
+                                                            onClick={() => setExpandedApiService(expandedApiService === service.id ? null : service.id)}
+                                                        >
+                                                            {expandedApiService === service.id ? <ExpandLess /> : <ExpandMore />}
+                                                        </IconButton>
+                                                    </Tooltip>
+                                                    <Tooltip title="Test API">
+                                                        <IconButton
+                                                            size="small"
+                                                            onClick={() => handleTestApiService(service.id)}
+                                                            disabled={testingApiService === service.id || !testPhoneNumber}
+                                                        >
+                                                            {testingApiService === service.id ? <CircularProgress size={20} /> : <PlayArrow />}
+                                                        </IconButton>
+                                                    </Tooltip>
+                                                    <Tooltip title="Toggle Active">
+                                                        <IconButton
+                                                            size="small"
+                                                            onClick={() => handleToggleApiService(service)}
+                                                        >
+                                                            <Switch checked={service.is_active} />
+                                                        </IconButton>
+                                                    </Tooltip>
+                                                    <IconButton size="small" onClick={() => handleEditApiService(service)}>
+                                                        <Edit />
+                                                    </IconButton>
+                                                    <IconButton size="small" color="error" onClick={() => handleDeleteApiService(service.id)}>
+                                                        <Delete />
+                                                    </IconButton>
+                                                </Box>
                                             </Box>
-                                        )}
+
+                                            <Collapse in={expandedApiService === service.id}>
+                                                <Box sx={{ mt: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                                                    <Grid container spacing={2}>
+                                                        <Grid item xs={12} md={6}>
+                                                            <Typography variant="subtitle2" sx={{ mb: 1 }}>Headers:</Typography>
+                                                            <pre style={{
+                                                                margin: 0,
+                                                                fontSize: '11px',
+                                                                overflow: 'auto',
+                                                                maxHeight: '150px',
+                                                                backgroundColor: 'background.paper',
+                                                                padding: '8px',
+                                                                borderRadius: '4px'
+                                                            }}>
+                                                                {formatJson(service.headers)}
+                                                            </pre>
+                                                        </Grid>
+                                                        {service.method !== 'GET' && service.request_body && (
+                                                            <Grid item xs={12} md={6}>
+                                                                <Typography variant="subtitle2" sx={{ mb: 1 }}>Request Body:</Typography>
+                                                                <pre style={{
+                                                                    margin: 0,
+                                                                    fontSize: '11px',
+                                                                    overflow: 'auto',
+                                                                    maxHeight: '150px',
+                                                                    backgroundColor: 'background.paper',
+                                                                    padding: '8px',
+                                                                    borderRadius: '4px'
+                                                                }}>
+                                                                    {formatJson(service.request_body || '{}')}
+                                                                </pre>
+                                                            </Grid>
+                                                        )}
+                                                        {service.response_path && (
+                                                            <Grid item xs={12}>
+                                                                <Typography variant="caption" color="text.secondary">
+                                                                    Response Path: <code>{service.response_path}</code>
+                                                                </Typography>
+                                                            </Grid>
+                                                        )}
+                                                        {service.keyword_paths && (
+                                                            <Grid item xs={12}>
+                                                                <Typography variant="caption" color="text.secondary">
+                                                                    Keyword Paths: <code>{service.keyword_paths}</code>
+                                                                </Typography>
+                                                            </Grid>
+                                                        )}
+                                                    </Grid>
+                                                </Box>
+                                            </Collapse>
+
+                                            {testResults[service.id] && (
+                                                <Box sx={{ mt: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                                                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Test Results:</Typography>
+                                                    {testResults[service.id].error ? (
+                                                        <Alert severity="error" icon={<ErrorIcon />}>{testResults[service.id].error}</Alert>
+                                                    ) : (
+                                                        <>
+                                                            <Box sx={{ display: 'flex', gap: 2, mb: 1, flexWrap: 'wrap' }}>
+                                                                <Chip
+                                                                    label={`Status: ${testResults[service.id].status_code}`}
+                                                                    color={testResults[service.id].status_code === 200 ? 'success' : 'error'}
+                                                                    size="small"
+                                                                    icon={testResults[service.id].status_code === 200 ? <CheckCircleIcon /> : <ErrorIcon />}
+                                                                />
+                                                                <Chip
+                                                                    label={`Response Time: ${testResults[service.id].response_time}ms`}
+                                                                    size="small"
+                                                                    variant="outlined"
+                                                                />
+                                                                <Chip
+                                                                    label={testResults[service.id].is_spam ? 'Spam Detected' : 'Clean'}
+                                                                    color={testResults[service.id].is_spam ? 'error' : 'success'}
+                                                                    size="small"
+                                                                />
+                                                            </Box>
+                                                            {testResults[service.id].keywords && testResults[service.id].keywords.length > 0 && (
+                                                                <Box sx={{ mb: 1 }}>
+                                                                    <Typography variant="caption">Keywords found: </Typography>
+                                                                    {testResults[service.id].keywords.map((kw: string, idx: number) => (
+                                                                        <Chip key={idx} label={kw} size="small" color="error" sx={{ ml: 0.5 }} />
+                                                                    ))}
+                                                                </Box>
+                                                            )}
+                                                            <Typography variant="subtitle2" sx={{ mb: 1 }}>Response:</Typography>
+                                                            <pre style={{
+                                                                margin: 0,
+                                                                fontSize: '12px',
+                                                                whiteSpace: 'pre-wrap',
+                                                                wordBreak: 'break-word',
+                                                                maxHeight: '200px',
+                                                                overflow: 'auto',
+                                                                backgroundColor: 'background.paper',
+                                                                padding: '8px',
+                                                                borderRadius: '4px'
+                                                            }}>
+                                                                {testResults[service.id].response}
+                                                            </pre>
+                                                        </>
+                                                    )}
+                                                </Box>
+                                            )}
+                                        </Box>
                                     </Paper>
                                 ))}
                             </List>
+
+                            {apiServices.length === 0 && (
+                                <Paper sx={{ p: 4, textAlign: 'center' }}>
+                                    <Api sx={{ fontSize: 48, color: 'text.secondary', mb: 2 }} />
+                                    <Typography variant="h6" sx={{ mb: 1 }}>No API Services Configured</Typography>
+                                    <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+                                        Add external API services to check phone numbers for spam
+                                    </Typography>
+                                    <Button variant="contained" startIcon={<Add />} onClick={handleAddApiService}>
+                                        Add First API Service
+                                    </Button>
+                                </Paper>
+                            )}
                         </TabPanel>
 
                         {/* OCR Settings */}
@@ -1160,6 +1317,191 @@ const SettingsPage: React.FC = observer(() => {
                     </CardContent>
                 </Card>
             )}
+
+            {/* API Service Dialog */}
+            <Dialog open={apiDialogOpen} onClose={() => setApiDialogOpen(false)} maxWidth="md" fullWidth>
+                <DialogTitle>{editingApiService?.id === 0 ? 'Add API Service' : 'Edit API Service'}</DialogTitle>
+                <DialogContent>
+                    <Box sx={{ mt: 2 }}>
+                        <Grid container spacing={2}>
+                            <Grid item xs={12}>
+                                <TextField
+                                    fullWidth
+                                    label="Service Name"
+                                    value={editingApiService?.name || ''}
+                                    onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, name: e.target.value } : null)}
+                                    helperText="Display name for this API service"
+                                />
+                            </Grid>
+                            <Grid item xs={12} md={6}>
+                                <TextField
+                                    fullWidth
+                                    label="Service Code"
+                                    value={editingApiService?.service_code || 'custom_api'}
+                                    onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, service_code: e.target.value } : null)}
+                                    helperText="Unique identifier for this service"
+                                />
+                            </Grid>
+                            <Grid item xs={12} md={3}>
+                                <FormControl fullWidth>
+                                    <InputLabel>Method</InputLabel>
+                                    <Select
+                                        value={editingApiService?.method || 'GET'}
+                                        label="Method"
+                                        onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, method: e.target.value } : null)}
+                                    >
+                                        <MenuItem value="GET">GET</MenuItem>
+                                        <MenuItem value="POST">POST</MenuItem>
+                                        <MenuItem value="PUT">PUT</MenuItem>
+                                    </Select>
+                                </FormControl>
+                            </Grid>
+                            <Grid item xs={12} md={3}>
+                                <TextField
+                                    fullWidth
+                                    label="Timeout (seconds)"
+                                    type="number"
+                                    value={editingApiService?.timeout || 30}
+                                    onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, timeout: parseInt(e.target.value) } : null)}
+                                    InputProps={{ inputProps: { min: 1, max: 300 } }}
+                                />
+                            </Grid>
+                            <Grid item xs={12}>
+                                <TextField
+                                    fullWidth
+                                    label="API URL"
+                                    value={editingApiService?.api_url || ''}
+                                    onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, api_url: e.target.value } : null)}
+                                    helperText="Use {{phone}} placeholder for phone number, e.g., https://api.example.com/check?phone={{phone}}"
+                                />
+                            </Grid>
+                            <Grid item xs={12}>
+                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                                    <Typography variant="subtitle2">Headers (JSON):</Typography>
+                                    <Button
+                                        size="small"
+                                        startIcon={<Code />}
+                                        onClick={() => handleOpenHeadersEditor(editingApiService?.headers || '{}')}
+                                    >
+                                        Edit Headers
+                                    </Button>
+                                </Box>
+                                <TextField
+                                    fullWidth
+                                    multiline
+                                    rows={4}
+                                    value={editingApiService?.headers || '{}'}
+                                    onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, headers: e.target.value } : null)}
+                                    error={!validateJson(editingApiService?.headers || '{}')}
+                                    helperText={!validateJson(editingApiService?.headers || '{}') ? 'Invalid JSON format' : 'HTTP headers to send with the request'}
+                                    sx={{ fontFamily: 'monospace', fontSize: '12px' }}
+                                />
+                            </Grid>
+                            {editingApiService?.method !== 'GET' && (
+                                <Grid item xs={12}>
+                                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Request Body (JSON):</Typography>
+                                    <TextField
+                                        fullWidth
+                                        multiline
+                                        rows={4}
+                                        value={editingApiService?.request_body || '{}'}
+                                        onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, request_body: e.target.value } : null)}
+                                        error={!validateJson(editingApiService?.request_body || '{}')}
+                                        helperText={!validateJson(editingApiService?.request_body || '{}') ? 'Invalid JSON format' : 'Use {{phone}} placeholder for phone number'}
+                                        sx={{ fontFamily: 'monospace', fontSize: '12px' }}
+                                    />
+                                </Grid>
+                            )}
+                            <Grid item xs={12} md={6}>
+                                <TextField
+                                    fullWidth
+                                    label="Response Path (JSONPath)"
+                                    value={editingApiService?.response_path || ''}
+                                    onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, response_path: e.target.value } : null)}
+                                    helperText="JSONPath to extract main response (e.g., $.data.name)"
+                                />
+                            </Grid>
+                            <Grid item xs={12} md={6}>
+                                <TextField
+                                    fullWidth
+                                    label="Keyword Paths (JSONPath)"
+                                    value={editingApiService?.keyword_paths || ''}
+                                    onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, keyword_paths: e.target.value } : null)}
+                                    helperText="JSONPath to extract keywords (e.g., $.data.tags[*])"
+                                />
+                            </Grid>
+                            <Grid item xs={12}>
+                                <FormControlLabel
+                                    control={
+                                        <Switch
+                                            checked={editingApiService?.is_active || false}
+                                            onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, is_active: e.target.checked } : null)}
+                                        />
+                                    }
+                                    label="Active"
+                                />
+                            </Grid>
+                            <Grid item xs={12}>
+                                <Alert severity="info" icon={<InfoIcon />}>
+                                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Example Configurations:</Typography>
+                                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                                        {Object.entries(exampleConfigs).map(([name, config]) => (
+                                            <Button
+                                                key={name}
+                                                size="small"
+                                                variant="outlined"
+                                                startIcon={<ContentCopy />}
+                                                onClick={() => {
+                                                    if (editingApiService) {
+                                                        setEditingApiService({
+                                                            ...editingApiService,
+                                                            headers: JSON.stringify(config.headers, null, 2),
+                                                            response_path: config.response_path || '',
+                                                            keyword_paths: config.keyword_paths || '',
+                                                        });
+                                                        enqueueSnackbar(`Loaded ${name} example configuration`, { variant: 'info' });
+                                                    }
+                                                }}
+                                            >
+                                                {name.charAt(0).toUpperCase() + name.slice(1)}
+                                            </Button>
+                                        ))}
+                                    </Box>
+                                </Alert>
+                            </Grid>
+                        </Grid>
+                    </Box>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setApiDialogOpen(false)}>{t('common.cancel')}</Button>
+                    <Button onClick={handleSaveApiService} variant="contained">{t('common.save')}</Button>
+                </DialogActions>
+            </Dialog>
+
+            {/* Headers Editor Dialog */}
+            <Dialog open={headersEditorOpen} onClose={() => setHeadersEditorOpen(false)} maxWidth="sm" fullWidth>
+                <DialogTitle>Edit Headers</DialogTitle>
+                <DialogContent>
+                    <Box sx={{ mt: 2 }}>
+                        <TextField
+                            fullWidth
+                            multiline
+                            rows={15}
+                            value={editingHeaders}
+                            onChange={(e) => setEditingHeaders(e.target.value)}
+                            error={!validateJson(editingHeaders)}
+                            helperText={!validateJson(editingHeaders) ? 'Invalid JSON format' : 'Edit headers in JSON format'}
+                            sx={{ fontFamily: 'monospace', fontSize: '12px' }}
+                        />
+                    </Box>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setHeadersEditorOpen(false)}>{t('common.cancel')}</Button>
+                    <Button onClick={handleSaveHeaders} variant="contained" disabled={!validateJson(editingHeaders)}>
+                        {t('common.save')}
+                    </Button>
+                </DialogActions>
+            </Dialog>
 
             {/* Gateway Dialog */}
             <Dialog open={adbDialogOpen} onClose={() => setAdbDialogOpen(false)} maxWidth="sm" fullWidth>

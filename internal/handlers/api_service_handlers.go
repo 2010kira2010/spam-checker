@@ -12,25 +12,29 @@ import (
 
 // CreateAPIServiceRequest represents API service creation request
 type CreateAPIServiceRequest struct {
-	Name        string `json:"name" validate:"required"`
-	ServiceCode string `json:"service_code" validate:"required,oneof=yandex_aon kaspersky getcontact custom"`
-	APIURL      string `json:"api_url" validate:"required"`
-	Headers     string `json:"headers"`
-	Method      string `json:"method" validate:"required,oneof=GET POST"`
-	RequestBody string `json:"request_body"`
-	Timeout     int    `json:"timeout" validate:"min=1,max=300"`
+	Name         string `json:"name" validate:"required"`
+	ServiceCode  string `json:"service_code" validate:"required,oneof=yandex_aon kaspersky getcontact custom"`
+	APIURL       string `json:"api_url" validate:"required"`
+	Headers      string `json:"headers"`
+	Method       string `json:"method" validate:"required,oneof=GET POST"`
+	RequestBody  string `json:"request_body"`
+	Timeout      int    `json:"timeout" validate:"min=1,max=300"`
+	KeywordPaths string `json:"keyword_paths"`
+	ResponsePath string `json:"response_path"`
 }
 
 // UpdateAPIServiceRequest represents API service update request
 type UpdateAPIServiceRequest struct {
-	Name        string `json:"name"`
-	ServiceCode string `json:"service_code"`
-	APIURL      string `json:"api_url"`
-	Headers     string `json:"headers"`
-	Method      string `json:"method"`
-	RequestBody string `json:"request_body"`
-	Timeout     *int   `json:"timeout"`
-	IsActive    *bool  `json:"is_active"`
+	Name         string `json:"name"`
+	ServiceCode  string `json:"service_code"`
+	APIURL       string `json:"api_url"`
+	Headers      string `json:"headers"`
+	Method       string `json:"method"`
+	RequestBody  string `json:"request_body"`
+	Timeout      *int   `json:"timeout"`
+	IsActive     *bool  `json:"is_active"`
+	KeywordPaths string `json:"keyword_paths"`
+	ResponsePath string `json:"response_path"`
 }
 
 // TestAPIServiceRequest represents API service test request
@@ -138,14 +142,16 @@ func createAPIServiceHandler(apiService *services.APICheckService) fiber.Handler
 		}
 
 		service := &models.APIService{
-			Name:        req.Name,
-			ServiceCode: req.ServiceCode,
-			APIURL:      req.APIURL,
-			Headers:     headers,
-			Method:      req.Method,
-			RequestBody: req.RequestBody,
-			Timeout:     timeout,
-			IsActive:    true,
+			Name:         req.Name,
+			ServiceCode:  req.ServiceCode,
+			APIURL:       req.APIURL,
+			Headers:      headers,
+			Method:       req.Method,
+			RequestBody:  req.RequestBody,
+			Timeout:      timeout,
+			IsActive:     true,
+			KeywordPaths: req.KeywordPaths,
+			ResponsePath: req.ResponsePath,
 		}
 
 		if err := apiService.CreateAPIService(service); err != nil {
@@ -209,6 +215,12 @@ func updateAPIServiceHandler(apiService *services.APICheckService) fiber.Handler
 		}
 		if req.IsActive != nil {
 			updates["is_active"] = *req.IsActive
+		}
+		if req.KeywordPaths != "" {
+			updates["keyword_paths"] = req.KeywordPaths
+		}
+		if req.ResponsePath != "" {
+			updates["response_path"] = req.ResponsePath
 		}
 
 		if err := apiService.UpdateAPIService(uint(id), updates); err != nil {

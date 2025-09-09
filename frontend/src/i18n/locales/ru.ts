@@ -189,6 +189,10 @@ export const ru = {
         saveSettings: 'Сохранить настройки',
         settingsSaved: 'Настройки успешно сохранены',
         // General
+        checkMode: 'Режим проверки',
+        checkModeADBonly: 'Только ADB-шлюзы - Проверка через эмуляторы Android',
+        checkModeAPIonly: 'Только API-сервисы - Проверка через внешние API',
+        checkModeBoth: 'Оба варианта - Проверка через ADB-шлюзы и API-сервисы',
         checkInterval: 'Интервал проверки (минуты)',
         checkIntervalHelp: 'Как часто проверять все активные номера',
         maxConcurrentChecks: 'Макс. одновременных проверок',

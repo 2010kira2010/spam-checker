@@ -81,7 +81,7 @@ const Layout: React.FC = observer(() => {
             text: t('navigation.checks'),
             icon: <CheckCircle />,
             path: '/checks',
-            badge: 3, // Example: show pending checks
+            //badge: 3, // Example: show pending checks
         },
         {
             text: t('navigation.statistics'),
@@ -157,14 +157,14 @@ const Layout: React.FC = observer(() => {
             title: t('notifications.checkCompleted'),
             message: '+7 999 123-45-67',
             time: '5 min ago',
-            read: false,
+            read: true,
         },
         {
             id: 2,
             title: t('phones.spam'),
             message: '+7 999 234-56-78',
             time: '1 hour ago',
-            read: false,
+            read: true,
         },
         {
             id: 3,
