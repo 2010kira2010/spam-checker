@@ -530,26 +530,45 @@ func (s *CheckService) checkViaAPIWithRetry(phone *models.PhoneNumber) error {
 			result.Service = &service
 
 			// Perform check with retries
+			var checkResult *models.CheckResult
+			var lastErr error
+
 			for retry := 0; retry <= s.maxRetries; retry++ {
 				log.Infof("Checking phone %s via API %s (attempt %d/%d)",
 					phone.Number, api.Name, retry+1, s.maxRetries+1)
 
-				checkResult, err := s.apiService.CheckPhoneViaAPI(phone, &api)
+				checkResult, err = s.apiService.CheckPhoneViaAPI(phone, &api)
 				if err != nil {
+					lastErr = err
 					if retry < s.maxRetries && s.isRetryableError(err) {
 						log.Warnf("API check failed, retrying: %v", err)
 						time.Sleep(s.retryDelay)
 						continue
 					}
 					result.Error = err
+					break
 				} else {
 					result.Result = checkResult
 					// Update statistics in transaction
 					s.db.Transaction(func(tx *gorm.DB) error {
 						return s.updateStatisticsInTx(tx, phone.ID, service.ID, checkResult.IsSpam)
 					})
+
+					// Log extracted data for debugging
+					if checkResult.RawText != "" {
+						log.Debugf("API %s extracted text: %s", api.Name, checkResult.RawText)
+					}
+					if len(checkResult.FoundKeywords) > 0 {
+						log.Debugf("API %s found keywords: %v", api.Name, []string(checkResult.FoundKeywords))
+					}
+
 					break
 				}
+			}
+
+			// If all retries failed, set the last error
+			if checkResult == nil && lastErr != nil {
+				result.Error = lastErr
 			}
 
 			resultChan <- result
@@ -566,6 +585,7 @@ func (s *CheckService) checkViaAPIWithRetry(phone *models.PhoneNumber) error {
 	successCount := 0
 	errorCount := 0
 	var lastError error
+	hasSpamDetection := false
 
 	for result := range resultChan {
 		if result.Error != nil {
@@ -575,11 +595,16 @@ func (s *CheckService) checkViaAPIWithRetry(phone *models.PhoneNumber) error {
 		} else {
 			successCount++
 			log.Infof("API check succeeded for %s", result.APIService.Name)
+
+			// Check if any service detected spam
+			if result.Result != nil && result.Result.IsSpam {
+				hasSpamDetection = true
+			}
 		}
 	}
 
-	log.Infof("API check completed for phone %s: %d successful, %d failed",
-		phone.Number, successCount, errorCount)
+	log.Infof("API check completed for phone %s: %d successful, %d failed, spam detected: %v",
+		phone.Number, successCount, errorCount, hasSpamDetection)
 
 	if successCount == 0 && errorCount > 0 {
 		return fmt.Errorf("all API checks failed: %v", lastError)
@@ -747,7 +772,7 @@ func (s *CheckService) getPhoneCheckLock(phoneID uint) *sync.Mutex {
 	return lock
 }
 
-// Helper methods remain the same...
+// Helper methods
 func (s *CheckService) getCheckMode() models.CheckMode {
 	var setting models.SystemSettings
 	if err := s.db.Where("key = ?", "check_mode").First(&setting).Error; err != nil {
@@ -835,9 +860,6 @@ func onlyDigits(input string) string {
 	return re.ReplaceAllString(input, "")
 }
 
-// CheckPhoneRealtime and other public methods remain the same but use the new internal methods...
-// GetCheckResults, GetLatestResults, etc. remain unchanged...
-
 // CheckPhoneRealtime checks phone number in real-time
 func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interface{}, error) {
 	log := s.log.WithFields(logrus.Fields{
@@ -873,12 +895,27 @@ func (s *CheckService) CheckPhoneRealtime(phoneNumber string) (map[string]interf
 
 				var serviceResults []map[string]interface{}
 				for _, result := range recentResults {
-					serviceResults = append(serviceResults, map[string]interface{}{
+					serviceResult := map[string]interface{}{
 						"service":        result.Service.Name,
 						"is_spam":        result.IsSpam,
 						"found_keywords": []string(result.FoundKeywords),
 						"checked_at":     result.CheckedAt,
-					})
+					}
+
+					// Add source information
+					if result.RawResponse != "" {
+						serviceResult["source"] = "api"
+						if result.RawText != "" {
+							serviceResult["extracted_text"] = result.RawText
+						}
+					} else if result.Screenshot != "" {
+						serviceResult["source"] = "adb"
+						if result.RawText != "" {
+							serviceResult["ocr_text"] = result.RawText
+						}
+					}
+
+					serviceResults = append(serviceResults, serviceResult)
 				}
 				results["results"] = serviceResults
 
@@ -942,12 +979,27 @@ func (s *CheckService) getPhoneResults(phone *models.PhoneNumber) (map[string]in
 
 	var serviceResults []map[string]interface{}
 	for _, result := range checkResults {
-		serviceResults = append(serviceResults, map[string]interface{}{
+		serviceResult := map[string]interface{}{
 			"service":        result.Service.Name,
 			"is_spam":        result.IsSpam,
 			"found_keywords": []string(result.FoundKeywords),
 			"checked_at":     result.CheckedAt,
-		})
+		}
+
+		// Add extracted text if available (from API response)
+		if result.RawText != "" && result.RawResponse != "" {
+			// This means it's an API result with extracted data
+			serviceResult["extracted_text"] = result.RawText
+			serviceResult["source"] = "api"
+		} else if result.Screenshot != "" {
+			// This is an ADB/screenshot result
+			serviceResult["source"] = "adb"
+			if result.RawText != "" {
+				serviceResult["ocr_text"] = result.RawText
+			}
+		}
+
+		serviceResults = append(serviceResults, serviceResult)
 	}
 	results["results"] = serviceResults
 
