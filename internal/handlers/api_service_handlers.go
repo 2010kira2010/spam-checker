@@ -6,6 +6,7 @@ import (
 	"spam-checker/internal/models"
 	"spam-checker/internal/services"
 	"strconv"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -13,7 +14,7 @@ import (
 // CreateAPIServiceRequest represents API service creation request
 type CreateAPIServiceRequest struct {
 	Name         string `json:"name" validate:"required"`
-	ServiceCode  string `json:"service_code" validate:"required,oneof=yandex_aon kaspersky getcontact custom"`
+	ServiceCode  string `json:"service_code" validate:"required"`
 	APIURL       string `json:"api_url" validate:"required"`
 	Headers      string `json:"headers"`
 	Method       string `json:"method" validate:"required,oneof=GET POST"`
@@ -129,6 +130,21 @@ func createAPIServiceHandler(apiService *services.APICheckService) fiber.Handler
 			})
 		}
 
+		// Validate service code - allow custom codes
+		validPredefinedCodes := map[string]bool{
+			"yandex_aon": true,
+			"kaspersky":  true,
+			"getcontact": true,
+		}
+
+		// If not a predefined code, ensure it starts with "custom" or is "custom"
+		if !validPredefinedCodes[req.ServiceCode] {
+			if req.ServiceCode != "custom" && !strings.HasPrefix(req.ServiceCode, "custom_") {
+				// Auto-prefix with custom_ for non-standard codes
+				req.ServiceCode = "custom_" + strings.ToLower(strings.ReplaceAll(req.ServiceCode, " ", "_"))
+			}
+		}
+
 		// Set default timeout if not provided
 		timeout := req.Timeout
 		if timeout == 0 {
@@ -196,6 +212,18 @@ func updateAPIServiceHandler(apiService *services.APICheckService) fiber.Handler
 			updates["name"] = req.Name
 		}
 		if req.ServiceCode != "" {
+			// Validate and normalize service code
+			validPredefinedCodes := map[string]bool{
+				"yandex_aon": true,
+				"kaspersky":  true,
+				"getcontact": true,
+			}
+
+			if !validPredefinedCodes[req.ServiceCode] {
+				if req.ServiceCode != "custom" && !strings.HasPrefix(req.ServiceCode, "custom_") {
+					req.ServiceCode = "custom_" + strings.ToLower(strings.ReplaceAll(req.ServiceCode, " ", "_"))
+				}
+			}
 			updates["service_code"] = req.ServiceCode
 		}
 		if req.APIURL != "" {

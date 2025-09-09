@@ -38,6 +38,26 @@ func (s *APICheckService) CreateAPIService(service *models.APIService) error {
 		}
 	}
 
+	// For custom API services, ensure the spam service exists
+	if service.ServiceCode == "custom" || strings.HasPrefix(service.ServiceCode, "custom_") {
+		// Check if spam service exists, if not create it
+		var spamService models.SpamService
+		err := s.db.Where("code = ?", service.ServiceCode).First(&spamService).Error
+		if err == gorm.ErrRecordNotFound {
+			// Create custom spam service
+			spamService = models.SpamService{
+				Name:     service.Name,
+				Code:     service.ServiceCode,
+				IsActive: true,
+				IsCustom: true,
+			}
+			if err := s.db.Create(&spamService).Error; err != nil {
+				return fmt.Errorf("failed to create spam service: %w", err)
+			}
+			s.log.Infof("Created custom spam service: %s (%s)", spamService.Name, spamService.Code)
+		}
+	}
+
 	if err := s.db.Create(service).Error; err != nil {
 		return fmt.Errorf("failed to create API service: %w", err)
 	}
@@ -82,6 +102,33 @@ func (s *APICheckService) UpdateAPIService(id uint, updates map[string]interface
 		}
 	}
 
+	// If service code is being updated, ensure spam service exists
+	if serviceCode, ok := updates["service_code"].(string); ok {
+		if serviceCode == "custom" || strings.HasPrefix(serviceCode, "custom_") {
+			var spamService models.SpamService
+			err := s.db.Where("code = ?", serviceCode).First(&spamService).Error
+			if err == gorm.ErrRecordNotFound {
+				// Get the API service to get its name
+				apiService, err := s.GetAPIServiceByID(id)
+				if err != nil {
+					return err
+				}
+
+				// Create custom spam service
+				spamService = models.SpamService{
+					Name:     apiService.Name,
+					Code:     serviceCode,
+					IsActive: true,
+					IsCustom: true,
+				}
+				if err := s.db.Create(&spamService).Error; err != nil {
+					return fmt.Errorf("failed to create spam service: %w", err)
+				}
+				s.log.Infof("Created custom spam service: %s (%s)", spamService.Name, spamService.Code)
+			}
+		}
+	}
+
 	if err := s.db.Model(&models.APIService{}).Where("id = ?", id).Updates(updates).Error; err != nil {
 		return fmt.Errorf("failed to update API service: %w", err)
 	}
@@ -105,10 +152,28 @@ func (s *APICheckService) CheckPhoneViaAPI(phone *models.PhoneNumber, apiService
 		"api":    apiService.Name,
 	})
 
-	// Get service info
+	// Get service info - first try exact match, then try predefined services
 	var service models.SpamService
-	if err := s.db.Where("code = ?", apiService.ServiceCode).First(&service).Error; err != nil {
-		return nil, fmt.Errorf("spam service not found: %w", err)
+	err := s.db.Where("code = ?", apiService.ServiceCode).First(&service).Error
+	if err == gorm.ErrRecordNotFound {
+		// If custom service doesn't exist, create it
+		if apiService.ServiceCode == "custom" || strings.HasPrefix(apiService.ServiceCode, "custom_") {
+			service = models.SpamService{
+				Name:     apiService.Name,
+				Code:     apiService.ServiceCode,
+				IsActive: true,
+				IsCustom: true,
+			}
+			if err := s.db.Create(&service).Error; err != nil {
+				return nil, fmt.Errorf("failed to create spam service: %w", err)
+			}
+			s.log.Infof("Created custom spam service on demand: %s (%s)", service.Name, service.Code)
+		} else {
+			// For predefined services, they should exist
+			return nil, fmt.Errorf("spam service not found: %s", apiService.ServiceCode)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to get spam service: %w", err)
 	}
 
 	log.Infof("Checking %s via API service %s", phone.Number, apiService.Name)
@@ -118,20 +183,20 @@ func (s *APICheckService) CheckPhoneViaAPI(phone *models.PhoneNumber, apiService
 
 	// Create request
 	var req *http.Request
-	var err error
+	var reqErr error
 
 	if apiService.Method == "POST" && apiService.RequestBody != "" {
 		// Replace placeholders in request body
 		body := s.replacePhonePlaceholder(apiService.RequestBody, phone.Number)
-		req, err = http.NewRequest(apiService.Method, url, bytes.NewBuffer([]byte(body)))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
+		req, reqErr = http.NewRequest(apiService.Method, url, bytes.NewBuffer([]byte(body)))
+		if reqErr != nil {
+			return nil, fmt.Errorf("failed to create request: %w", reqErr)
 		}
 		req.Header.Set("Content-Type", "application/json")
 	} else {
-		req, err = http.NewRequest(apiService.Method, url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
+		req, reqErr = http.NewRequest(apiService.Method, url, nil)
+		if reqErr != nil {
+			return nil, fmt.Errorf("failed to create request: %w", reqErr)
 		}
 	}
 
@@ -181,8 +246,9 @@ func (s *APICheckService) CheckPhoneViaAPI(phone *models.PhoneNumber, apiService
 		log.Debugf("Extracted keywords using path '%s': %v", apiService.KeywordPaths, extractedKeywords)
 	}
 
-	// Analyze response for spam
-	isSpam, foundKeywords := s.analyzeAPIResponse(rawResponse, extractedText, extractedKeywords, service.ID)
+	// Analyze response for spam - pass whether we have path-based extraction
+	hasPathExtraction := apiService.ResponsePath != "" || apiService.KeywordPaths != ""
+	isSpam, foundKeywords := s.analyzeAPIResponse(rawResponse, extractedText, extractedKeywords, service.ID, hasPathExtraction)
 
 	// Save result
 	result := &models.CheckResult{
@@ -307,10 +373,11 @@ func (s *APICheckService) convertToGJSONPath(jsonPath string) string {
 }
 
 // analyzeAPIResponse analyzes API response for spam indicators
-func (s *APICheckService) analyzeAPIResponse(rawResponse string, extractedText string, extractedKeywords []string, serviceID uint) (bool, []string) {
+func (s *APICheckService) analyzeAPIResponse(rawResponse string, extractedText string, extractedKeywords []string, serviceID uint, hasPathExtraction bool) (bool, []string) {
 	log := s.log.WithFields(logrus.Fields{
-		"method":    "analyzeAPIResponse",
-		"serviceID": serviceID,
+		"method":            "analyzeAPIResponse",
+		"serviceID":         serviceID,
+		"hasPathExtraction": hasPathExtraction,
 	})
 
 	var foundKeywords []string
@@ -340,13 +407,23 @@ func (s *APICheckService) analyzeAPIResponse(rawResponse string, extractedText s
 		// Also check if extracted keyword contains any database keywords
 		for dbKwLower, dbKwOriginal := range keywordSet {
 			if strings.Contains(extractedLower, dbKwLower) {
-				foundKeywords = append(foundKeywords, dbKwOriginal)
+				// Check if not already added
+				alreadyAdded := false
+				for _, fk := range foundKeywords {
+					if fk == dbKwOriginal {
+						alreadyAdded = true
+						break
+					}
+				}
+				if !alreadyAdded {
+					foundKeywords = append(foundKeywords, dbKwOriginal)
+				}
 			}
 		}
 	}
 
-	// Check extracted text for keywords
-	if extractedText != "" {
+	// If we have path-based extraction, prioritize checking extracted text
+	if hasPathExtraction && extractedText != "" {
 		textLower := strings.ToLower(extractedText)
 		for dbKwLower, dbKwOriginal := range keywordSet {
 			if strings.Contains(textLower, dbKwLower) {
@@ -363,22 +440,23 @@ func (s *APICheckService) analyzeAPIResponse(rawResponse string, extractedText s
 				}
 			}
 		}
-	}
-
-	// Also check the full response for keywords (as fallback)
-	responseLower := strings.ToLower(rawResponse)
-	for dbKwLower, dbKwOriginal := range keywordSet {
-		if strings.Contains(responseLower, dbKwLower) {
-			// Check if not already added
-			alreadyAdded := false
-			for _, fk := range foundKeywords {
-				if fk == dbKwOriginal {
-					alreadyAdded = true
-					break
+	} else if !hasPathExtraction {
+		// Only check full response if no path extraction is configured
+		// This prevents finding keywords in the entire response when paths are specified
+		responseLower := strings.ToLower(rawResponse)
+		for dbKwLower, dbKwOriginal := range keywordSet {
+			if strings.Contains(responseLower, dbKwLower) {
+				// Check if not already added
+				alreadyAdded := false
+				for _, fk := range foundKeywords {
+					if fk == dbKwOriginal {
+						alreadyAdded = true
+						break
+					}
 				}
-			}
-			if !alreadyAdded {
-				foundKeywords = append(foundKeywords, dbKwOriginal)
+				if !alreadyAdded {
+					foundKeywords = append(foundKeywords, dbKwOriginal)
+				}
 			}
 		}
 	}
@@ -556,12 +634,28 @@ func (s *APICheckService) TestAPIService(id uint, testPhone string) (map[string]
 		extractedKeywords = s.extractKeywordsWithJSONPath(responseStr, apiService.KeywordPaths)
 	}
 
-	// Get service ID for keyword lookup
+	// Get or create service for keyword lookup
 	var service models.SpamService
-	s.db.Where("code = ?", apiService.ServiceCode).First(&service)
+	err = s.db.Where("code = ?", apiService.ServiceCode).First(&service).Error
+	if err == gorm.ErrRecordNotFound {
+		// For test, create temporary service if custom
+		if apiService.ServiceCode == "custom" || strings.HasPrefix(apiService.ServiceCode, "custom_") {
+			service = models.SpamService{
+				ID:       0, // Temporary ID for test
+				Name:     apiService.Name,
+				Code:     apiService.ServiceCode,
+				IsActive: true,
+				IsCustom: true,
+			}
+		} else {
+			// Use service ID 0 for test if not found
+			service.ID = 0
+		}
+	}
 
-	// Analyze for spam
-	isSpam, keywords := s.analyzeAPIResponse(responseStr, extractedText, extractedKeywords, service.ID)
+	// Analyze for spam - indicate we have path extraction if configured
+	hasPathExtraction := apiService.ResponsePath != "" || apiService.KeywordPaths != ""
+	isSpam, keywords := s.analyzeAPIResponse(responseStr, extractedText, extractedKeywords, service.ID, hasPathExtraction)
 
 	return map[string]interface{}{
 		"success":            true,

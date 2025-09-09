@@ -520,15 +520,6 @@ func (s *CheckService) checkViaAPIWithRetry(phone *models.PhoneNumber) error {
 				APIService: &api,
 			}
 
-			// Get service info
-			var service models.SpamService
-			if err := s.db.Where("code = ?", api.ServiceCode).First(&service).Error; err != nil {
-				result.Error = fmt.Errorf("service not found: %w", err)
-				resultChan <- result
-				return
-			}
-			result.Service = &service
-
 			// Perform check with retries
 			var checkResult *models.CheckResult
 			var lastErr error
@@ -549,10 +540,19 @@ func (s *CheckService) checkViaAPIWithRetry(phone *models.PhoneNumber) error {
 					break
 				} else {
 					result.Result = checkResult
-					// Update statistics in transaction
-					s.db.Transaction(func(tx *gorm.DB) error {
-						return s.updateStatisticsInTx(tx, phone.ID, service.ID, checkResult.IsSpam)
-					})
+
+					// Get service info after successful check (it should be created by CheckPhoneViaAPI if needed)
+					var service models.SpamService
+					if err := s.db.Where("code = ?", api.ServiceCode).First(&service).Error; err == nil {
+						result.Service = &service
+
+						// Update statistics in transaction
+						s.db.Transaction(func(tx *gorm.DB) error {
+							return s.updateStatisticsInTx(tx, phone.ID, service.ID, checkResult.IsSpam)
+						})
+					} else {
+						log.Warnf("Failed to get service after check: %v", err)
+					}
 
 					// Log extracted data for debugging
 					if checkResult.RawText != "" {
