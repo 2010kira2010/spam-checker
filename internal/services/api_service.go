@@ -381,6 +381,7 @@ func (s *APICheckService) analyzeAPIResponse(rawResponse string, extractedText s
 	})
 
 	var foundKeywords []string
+	foundKeywordsSet := make(map[string]bool) // To avoid duplicates
 
 	// Get spam keywords from database
 	var dbKeywords []models.SpamKeyword
@@ -398,127 +399,56 @@ func (s *APICheckService) analyzeAPIResponse(rawResponse string, extractedText s
 		keywordSet[strings.ToLower(kw.Keyword)] = kw.Keyword
 	}
 
+	// Helper function to add keyword without duplicates
+	addKeyword := func(keyword string) {
+		if !foundKeywordsSet[keyword] {
+			foundKeywordsSet[keyword] = true
+			foundKeywords = append(foundKeywords, keyword)
+		}
+	}
+
 	// Check extracted keywords against database keywords
 	for _, extractedKw := range extractedKeywords {
 		extractedLower := strings.ToLower(extractedKw)
+
+		// Direct match
 		if original, exists := keywordSet[extractedLower]; exists {
-			foundKeywords = append(foundKeywords, original)
+			addKeyword(original)
 		}
-		// Also check if extracted keyword contains any database keywords
+
+		// Partial match - check if extracted keyword contains any database keywords
 		for dbKwLower, dbKwOriginal := range keywordSet {
 			if strings.Contains(extractedLower, dbKwLower) {
-				// Check if not already added
-				alreadyAdded := false
-				for _, fk := range foundKeywords {
-					if fk == dbKwOriginal {
-						alreadyAdded = true
-						break
-					}
-				}
-				if !alreadyAdded {
-					foundKeywords = append(foundKeywords, dbKwOriginal)
-				}
+				addKeyword(dbKwOriginal)
 			}
 		}
 	}
 
-	// If we have path-based extraction, prioritize checking extracted text
-	if hasPathExtraction && extractedText != "" {
-		textLower := strings.ToLower(extractedText)
+	// Search for keywords in the appropriate text based on extraction configuration
+	var searchText string
+	if hasPathExtraction {
+		// If we have path extraction configured, search only in extracted text
+		searchText = strings.ToLower(extractedText)
+	} else {
+		// If no path extraction, search in the entire raw response
+		searchText = strings.ToLower(rawResponse)
+	}
+
+	// Search for database keywords in the text
+	if searchText != "" {
 		for dbKwLower, dbKwOriginal := range keywordSet {
-			if strings.Contains(textLower, dbKwLower) {
-				// Check if not already added
-				alreadyAdded := false
-				for _, fk := range foundKeywords {
-					if fk == dbKwOriginal {
-						alreadyAdded = true
-						break
-					}
-				}
-				if !alreadyAdded {
-					foundKeywords = append(foundKeywords, dbKwOriginal)
-				}
-			}
-		}
-	} else if !hasPathExtraction {
-		// Only check full response if no path extraction is configured
-		// This prevents finding keywords in the entire response when paths are specified
-		responseLower := strings.ToLower(rawResponse)
-		for dbKwLower, dbKwOriginal := range keywordSet {
-			if strings.Contains(responseLower, dbKwLower) {
-				// Check if not already added
-				alreadyAdded := false
-				for _, fk := range foundKeywords {
-					if fk == dbKwOriginal {
-						alreadyAdded = true
-						break
-					}
-				}
-				if !alreadyAdded {
-					foundKeywords = append(foundKeywords, dbKwOriginal)
-				}
+			if strings.Contains(searchText, dbKwLower) {
+				addKeyword(dbKwOriginal)
 			}
 		}
 	}
 
-	// Also check for common spam indicators in JSON structure
-	isSpamFromStructure := s.checkJSONForSpamIndicators(rawResponse)
-
-	// Determine if it's spam
-	isSpam := len(foundKeywords) > 0 || isSpamFromStructure
+	// Determine if it's spam based on found keywords
+	isSpam := len(foundKeywords) > 0
 
 	log.Debugf("Analysis complete: isSpam=%v, foundKeywords=%v", isSpam, foundKeywords)
 
 	return isSpam, foundKeywords
-}
-
-// checkJSONForSpamIndicators checks JSON response for common spam indicator fields
-func (s *APICheckService) checkJSONForSpamIndicators(jsonStr string) bool {
-	// Common spam indicator fields
-	spamFields := []string{
-		"spam",
-		"is_spam",
-		"isSpam",
-		"unwanted",
-		"junk",
-		"спам",
-		"нежелательный",
-		"fraud",
-		"scam",
-		"мошенник",
-	}
-
-	jsonLower := strings.ToLower(jsonStr)
-
-	for _, field := range spamFields {
-		// Check various patterns
-		patterns := []string{
-			fmt.Sprintf(`"%s":true`, field),
-			fmt.Sprintf(`"%s": true`, field),
-			fmt.Sprintf(`"%s":"true"`, field),
-			fmt.Sprintf(`"%s": "true"`, field),
-			fmt.Sprintf(`"%s":"yes"`, field),
-			fmt.Sprintf(`"%s": "yes"`, field),
-			fmt.Sprintf(`"%s":"да"`, field),
-			fmt.Sprintf(`"%s": "да"`, field),
-			fmt.Sprintf(`"%s":1`, field),
-			fmt.Sprintf(`"%s": 1`, field),
-		}
-
-		for _, pattern := range patterns {
-			if strings.Contains(jsonLower, pattern) {
-				return true
-			}
-		}
-	}
-
-	// Check for negative polarity
-	if strings.Contains(jsonLower, `"polarity":"negative"`) ||
-		strings.Contains(jsonLower, `"polarity": "negative"`) {
-		return true
-	}
-
-	return false
 }
 
 // replacePhonePlaceholder replaces phone number placeholders in string

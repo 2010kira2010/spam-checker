@@ -798,7 +798,7 @@ const SettingsPage: React.FC = observer(() => {
                         <Tabs value={tabValue} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
                             <Tab icon={<SettingsIcon />} label={t('settings.general')} />
                             <Tab icon={<Android />} label={t('settings.adbGateways')} />
-                            <Tab icon={<Api />} label="API Services" />
+                            <Tab icon={<Api />} label={t('settings.apiServices')} />
                             <Tab icon={<Scanner />} label={t('settings.ocrSettings')} />
                             <Tab icon={<TextFields />} label={t('settings.keywords')} />
                             <Tab icon={<Schedule />} label={t('settings.schedules')} />
@@ -950,24 +950,24 @@ const SettingsPage: React.FC = observer(() => {
                         {/* API Services */}
                         <TabPanel value={tabValue} index={2}>
                             <Box sx={{ mb: 3, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                <Typography variant="h6">API Services</Typography>
+                                <Typography variant="h6">{t('settings.apiServices')}</Typography>
                                 <Button variant="contained" startIcon={<Add />} onClick={handleAddApiService}>
-                                    Add API Service
+                                    {t('settings.apiServicesAdd')}
                                 </Button>
                             </Box>
 
                             <Alert severity="info" sx={{ mb: 3 }}>
-                                Configure external APIs to check phone numbers. Enter a test phone number below to test services instantly.
+                                {t('settings.apiServicesInformer')}
                             </Alert>
 
                             <Box sx={{ mb: 3 }}>
                                 <TextField
                                     fullWidth
-                                    label="Test Phone Number"
+                                    label={t('settings.apiServicesTestPhone')}
                                     placeholder="+7 (999) 123-45-67"
                                     value={testPhoneNumber}
                                     onChange={(e) => setTestPhoneNumber(e.target.value)}
-                                    helperText="Enter a phone number to test API services"
+                                    helperText={t('settings.apiServicesHelperText')}
                                     InputProps={{
                                         startAdornment: (
                                             <InputAdornment position="start">
@@ -1002,7 +1002,7 @@ const SettingsPage: React.FC = observer(() => {
                                                                 variant="outlined"
                                                             />
                                                             <Chip
-                                                                label={service.is_active ? 'Active' : 'Inactive'}
+                                                                label={service.is_active ? t('settings.apiServiceActive') : t('settings.apiServiceInactive')}
                                                                 size="small"
                                                                 color={service.is_active ? 'success' : 'default'}
                                                             />
@@ -1016,12 +1016,12 @@ const SettingsPage: React.FC = observer(() => {
                                                             {service.api_url}
                                                         </Typography>
                                                         <Typography variant="caption" color="text.secondary">
-                                                            Timeout: {service.timeout}s
+                                                            {t('settings.apiServiceTimeout', { seconds: service.timeout })}
                                                         </Typography>
                                                     </Box>
                                                 </Box>
                                                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                                    <Tooltip title="Expand Details">
+                                                    <Tooltip title={t('settings.apiServiceExpandDetails')}>
                                                         <IconButton
                                                             size="small"
                                                             onClick={() => setExpandedApiService(expandedApiService === service.id ? null : service.id)}
@@ -1029,7 +1029,7 @@ const SettingsPage: React.FC = observer(() => {
                                                             {expandedApiService === service.id ? <ExpandLess /> : <ExpandMore />}
                                                         </IconButton>
                                                     </Tooltip>
-                                                    <Tooltip title="Test API">
+                                                    <Tooltip title={t('settings.apiServiceTest')}>
                                                         <IconButton
                                                             size="small"
                                                             onClick={() => handleTestApiService(service.id)}
@@ -1038,7 +1038,7 @@ const SettingsPage: React.FC = observer(() => {
                                                             {testingApiService === service.id ? <CircularProgress size={20} /> : <PlayArrow />}
                                                         </IconButton>
                                                     </Tooltip>
-                                                    <Tooltip title="Toggle Active">
+                                                    <Tooltip title={t('settings.apiServiceToggleActive')}>
                                                         <IconButton
                                                             size="small"
                                                             onClick={() => handleToggleApiService(service)}
@@ -1059,7 +1059,7 @@ const SettingsPage: React.FC = observer(() => {
                                                 <Box sx={{ mt: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
                                                     <Grid container spacing={2}>
                                                         <Grid item xs={12} md={6}>
-                                                            <Typography variant="subtitle2" sx={{ mb: 1 }}>Headers:</Typography>
+                                                            <Typography variant="subtitle2" sx={{ mb: 1 }}>{t('settings.apiServiceHeaders')}</Typography>
                                                             <pre style={{
                                                                 margin: 0,
                                                                 fontSize: '11px',
@@ -1069,12 +1069,12 @@ const SettingsPage: React.FC = observer(() => {
                                                                 padding: '8px',
                                                                 borderRadius: '4px'
                                                             }}>
-                                                                {formatJson(service.headers)}
-                                                            </pre>
+                                        {formatJson(service.headers)}
+                                    </pre>
                                                         </Grid>
                                                         {service.method !== 'GET' && service.request_body && (
                                                             <Grid item xs={12} md={6}>
-                                                                <Typography variant="subtitle2" sx={{ mb: 1 }}>Request Body:</Typography>
+                                                                <Typography variant="subtitle2" sx={{ mb: 1 }}>{t('settings.apiServiceRequestBody')}</Typography>
                                                                 <pre style={{
                                                                     margin: 0,
                                                                     fontSize: '11px',
@@ -1084,21 +1084,21 @@ const SettingsPage: React.FC = observer(() => {
                                                                     padding: '8px',
                                                                     borderRadius: '4px'
                                                                 }}>
-                                                                    {formatJson(service.request_body || '{}')}
-                                                                </pre>
+                                            {formatJson(service.request_body || '{}')}
+                                        </pre>
                                                             </Grid>
                                                         )}
                                                         {service.response_path && (
                                                             <Grid item xs={12}>
                                                                 <Typography variant="caption" color="text.secondary">
-                                                                    Response Path: <code>{service.response_path}</code>
+                                                                    {t('settings.apiServiceResponsePath')} <code>{service.response_path}</code>
                                                                 </Typography>
                                                             </Grid>
                                                         )}
                                                         {service.keyword_paths && (
                                                             <Grid item xs={12}>
                                                                 <Typography variant="caption" color="text.secondary">
-                                                                    Keyword Paths: <code>{service.keyword_paths}</code>
+                                                                    {t('settings.apiServiceKeywordPaths')} <code>{service.keyword_paths}</code>
                                                                 </Typography>
                                                             </Grid>
                                                         )}
@@ -1108,38 +1108,38 @@ const SettingsPage: React.FC = observer(() => {
 
                                             {testResults[service.id] && (
                                                 <Box sx={{ mt: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
-                                                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Test Results:</Typography>
+                                                    <Typography variant="subtitle2" sx={{ mb: 1 }}>{t('settings.apiServiceTestResults')}</Typography>
                                                     {testResults[service.id].error ? (
                                                         <Alert severity="error" icon={<ErrorIcon />}>{testResults[service.id].error}</Alert>
                                                     ) : (
                                                         <>
                                                             <Box sx={{ display: 'flex', gap: 2, mb: 1, flexWrap: 'wrap' }}>
                                                                 <Chip
-                                                                    label={`Status: ${testResults[service.id].status_code}`}
+                                                                    label={t('settings.apiServiceStatus', { code: testResults[service.id].status_code })}
                                                                     color={testResults[service.id].status_code === 200 ? 'success' : 'error'}
                                                                     size="small"
                                                                     icon={testResults[service.id].status_code === 200 ? <CheckCircleIcon /> : <ErrorIcon />}
                                                                 />
                                                                 <Chip
-                                                                    label={`Response Time: ${testResults[service.id].response_time}ms`}
+                                                                    label={t('settings.apiServiceResponseTime', { time: testResults[service.id].response_time })}
                                                                     size="small"
                                                                     variant="outlined"
                                                                 />
                                                                 <Chip
-                                                                    label={testResults[service.id].is_spam ? 'Spam Detected' : 'Clean'}
+                                                                    label={testResults[service.id].is_spam ? t('settings.apiServiceSpamDetected') : t('settings.apiServiceClean')}
                                                                     color={testResults[service.id].is_spam ? 'error' : 'success'}
                                                                     size="small"
                                                                 />
                                                             </Box>
                                                             {testResults[service.id].keywords && testResults[service.id].keywords.length > 0 && (
                                                                 <Box sx={{ mb: 1 }}>
-                                                                    <Typography variant="caption">Keywords found: </Typography>
+                                                                    <Typography variant="caption">{t('settings.apiServiceKeywordsFound')} </Typography>
                                                                     {testResults[service.id].keywords.map((kw: string, idx: number) => (
                                                                         <Chip key={idx} label={kw} size="small" color="error" sx={{ ml: 0.5 }} />
                                                                     ))}
                                                                 </Box>
                                                             )}
-                                                            <Typography variant="subtitle2" sx={{ mb: 1 }}>Response:</Typography>
+                                                            <Typography variant="subtitle2" sx={{ mb: 1 }}>{t('settings.apiServiceResponse')}</Typography>
                                                             <pre style={{
                                                                 margin: 0,
                                                                 fontSize: '12px',
@@ -1151,8 +1151,8 @@ const SettingsPage: React.FC = observer(() => {
                                                                 padding: '8px',
                                                                 borderRadius: '4px'
                                                             }}>
-                                                                {testResults[service.id].response}
-                                                            </pre>
+                                        {testResults[service.id].response}
+                                    </pre>
                                                         </>
                                                     )}
                                                 </Box>
@@ -1165,12 +1165,12 @@ const SettingsPage: React.FC = observer(() => {
                             {apiServices.length === 0 && (
                                 <Paper sx={{ p: 4, textAlign: 'center' }}>
                                     <Api sx={{ fontSize: 48, color: 'text.secondary', mb: 2 }} />
-                                    <Typography variant="h6" sx={{ mb: 1 }}>No API Services Configured</Typography>
+                                    <Typography variant="h6" sx={{ mb: 1 }}>{t('settings.apiServiceNoServices')}</Typography>
                                     <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-                                        Add external API services to check phone numbers for spam
+                                        {t('settings.apiServiceNoServicesDescription')}
                                     </Typography>
                                     <Button variant="contained" startIcon={<Add />} onClick={handleAddApiService}>
-                                        Add First API Service
+                                        {t('settings.apiServiceAddFirst')}
                                     </Button>
                                 </Paper>
                             )}
@@ -1320,34 +1320,36 @@ const SettingsPage: React.FC = observer(() => {
 
             {/* API Service Dialog */}
             <Dialog open={apiDialogOpen} onClose={() => setApiDialogOpen(false)} maxWidth="md" fullWidth>
-                <DialogTitle>{editingApiService?.id === 0 ? 'Add API Service' : 'Edit API Service'}</DialogTitle>
+                <DialogTitle>
+                    {editingApiService?.id === 0 ? t('settings.apiServiceDialogAddTitle') : t('settings.apiServiceDialogEditTitle')}
+                </DialogTitle>
                 <DialogContent>
                     <Box sx={{ mt: 2 }}>
                         <Grid container spacing={2}>
                             <Grid item xs={12}>
                                 <TextField
                                     fullWidth
-                                    label="Service Name"
+                                    label={t('settings.apiServiceDialogServiceName')}
                                     value={editingApiService?.name || ''}
                                     onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, name: e.target.value } : null)}
-                                    helperText="Display name for this API service"
+                                    helperText={t('settings.apiServiceDialogServiceNameHelper')}
                                 />
                             </Grid>
                             <Grid item xs={12} md={6}>
                                 <TextField
                                     fullWidth
-                                    label="Service Code"
+                                    label={t('settings.apiServiceDialogServiceCode')}
                                     value={editingApiService?.service_code || 'custom_api'}
                                     onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, service_code: e.target.value } : null)}
-                                    helperText="Unique identifier for this service"
+                                    helperText={t('settings.apiServiceDialogServiceCodeHelper')}
                                 />
                             </Grid>
                             <Grid item xs={12} md={3}>
                                 <FormControl fullWidth>
-                                    <InputLabel>Method</InputLabel>
+                                    <InputLabel>{t('settings.apiServiceDialogMethod')}</InputLabel>
                                     <Select
                                         value={editingApiService?.method || 'GET'}
-                                        label="Method"
+                                        label={t('settings.apiServiceDialogMethod')}
                                         onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, method: e.target.value } : null)}
                                     >
                                         <MenuItem value="GET">GET</MenuItem>
@@ -1359,7 +1361,7 @@ const SettingsPage: React.FC = observer(() => {
                             <Grid item xs={12} md={3}>
                                 <TextField
                                     fullWidth
-                                    label="Timeout (seconds)"
+                                    label={t('settings.apiServiceDialogTimeout')}
                                     type="number"
                                     value={editingApiService?.timeout || 30}
                                     onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, timeout: parseInt(e.target.value) } : null)}
@@ -1369,21 +1371,21 @@ const SettingsPage: React.FC = observer(() => {
                             <Grid item xs={12}>
                                 <TextField
                                     fullWidth
-                                    label="API URL"
+                                    label={t('settings.apiServiceDialogApiUrl')}
                                     value={editingApiService?.api_url || ''}
                                     onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, api_url: e.target.value } : null)}
-                                    helperText="Use {{phone}} placeholder for phone number, e.g., https://api.example.com/check?phone={{phone}}"
+                                    helperText={t('settings.apiServiceDialogApiUrlHelper')}
                                 />
                             </Grid>
                             <Grid item xs={12}>
                                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <Typography variant="subtitle2">Headers (JSON):</Typography>
+                                    <Typography variant="subtitle2">{t('settings.apiServiceDialogHeaders')}</Typography>
                                     <Button
                                         size="small"
                                         startIcon={<Code />}
                                         onClick={() => handleOpenHeadersEditor(editingApiService?.headers || '{}')}
                                     >
-                                        Edit Headers
+                                        {t('settings.apiServiceDialogEditHeaders')}
                                     </Button>
                                 </Box>
                                 <TextField
@@ -1393,13 +1395,13 @@ const SettingsPage: React.FC = observer(() => {
                                     value={editingApiService?.headers || '{}'}
                                     onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, headers: e.target.value } : null)}
                                     error={!validateJson(editingApiService?.headers || '{}')}
-                                    helperText={!validateJson(editingApiService?.headers || '{}') ? 'Invalid JSON format' : 'HTTP headers to send with the request'}
+                                    helperText={!validateJson(editingApiService?.headers || '{}') ? t('settings.apiServiceDialogInvalidJson') : t('settings.apiServiceDialogHeadersHelper')}
                                     sx={{ fontFamily: 'monospace', fontSize: '12px' }}
                                 />
                             </Grid>
                             {editingApiService?.method !== 'GET' && (
                                 <Grid item xs={12}>
-                                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Request Body (JSON):</Typography>
+                                    <Typography variant="subtitle2" sx={{ mb: 1 }}>{t('settings.apiServiceDialogRequestBody')}</Typography>
                                     <TextField
                                         fullWidth
                                         multiline
@@ -1407,7 +1409,7 @@ const SettingsPage: React.FC = observer(() => {
                                         value={editingApiService?.request_body || '{}'}
                                         onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, request_body: e.target.value } : null)}
                                         error={!validateJson(editingApiService?.request_body || '{}')}
-                                        helperText={!validateJson(editingApiService?.request_body || '{}') ? 'Invalid JSON format' : 'Use {{phone}} placeholder for phone number'}
+                                        helperText={!validateJson(editingApiService?.request_body || '{}') ? t('settings.apiServiceDialogInvalidJson') : t('settings.apiServiceDialogRequestBodyHelper')}
                                         sx={{ fontFamily: 'monospace', fontSize: '12px' }}
                                     />
                                 </Grid>
@@ -1415,19 +1417,19 @@ const SettingsPage: React.FC = observer(() => {
                             <Grid item xs={12} md={6}>
                                 <TextField
                                     fullWidth
-                                    label="Response Path (JSONPath)"
+                                    label={t('settings.apiServiceDialogResponsePath')}
                                     value={editingApiService?.response_path || ''}
                                     onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, response_path: e.target.value } : null)}
-                                    helperText="JSONPath to extract main response (e.g., $.data.name)"
+                                    helperText={t('settings.apiServiceDialogResponsePathHelper')}
                                 />
                             </Grid>
                             <Grid item xs={12} md={6}>
                                 <TextField
                                     fullWidth
-                                    label="Keyword Paths (JSONPath)"
+                                    label={t('settings.apiServiceDialogKeywordPaths')}
                                     value={editingApiService?.keyword_paths || ''}
                                     onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, keyword_paths: e.target.value } : null)}
-                                    helperText="JSONPath to extract keywords (e.g., $.data.tags[*])"
+                                    helperText={t('settings.apiServiceDialogKeywordPathsHelper')}
                                 />
                             </Grid>
                             <Grid item xs={12}>
@@ -1438,12 +1440,12 @@ const SettingsPage: React.FC = observer(() => {
                                             onChange={(e) => setEditingApiService(editingApiService ? { ...editingApiService, is_active: e.target.checked } : null)}
                                         />
                                     }
-                                    label="Active"
+                                    label={t('settings.apiServiceDialogActive')}
                                 />
                             </Grid>
                             <Grid item xs={12}>
                                 <Alert severity="info" icon={<InfoIcon />}>
-                                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Example Configurations:</Typography>
+                                    <Typography variant="subtitle2" sx={{ mb: 1 }}>{t('settings.apiServiceDialogExampleConfigs')}</Typography>
                                     <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
                                         {Object.entries(exampleConfigs).map(([name, config]) => (
                                             <Button
@@ -1459,7 +1461,7 @@ const SettingsPage: React.FC = observer(() => {
                                                             response_path: config.response_path || '',
                                                             keyword_paths: config.keyword_paths || '',
                                                         });
-                                                        enqueueSnackbar(`Loaded ${name} example configuration`, { variant: 'info' });
+                                                        enqueueSnackbar(t('settings.apiServiceDialogConfigLoaded', { name: name.charAt(0).toUpperCase() + name.slice(1) }), { variant: 'info' });
                                                     }
                                                 }}
                                             >

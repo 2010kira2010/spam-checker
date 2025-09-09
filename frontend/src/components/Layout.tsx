@@ -352,7 +352,7 @@ const Layout: React.FC = observer(() => {
                 <Divider sx={{ borderColor: 'rgba(255, 255, 255, 0.1)' }} />
                 <Box sx={{ p: 2 }}>
                     <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                        © 2024 SpamChecker
+                        © {new Date().getFullYear()} SpamChecker
                     </Typography>
                 </Box>
             </Drawer>
