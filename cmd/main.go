@@ -91,6 +91,7 @@ func main() {
 	settingsService := services.NewSettingsService(db)
 	statisticsService := services.NewStatisticsService(db)
 	notificationService := services.NewNotificationService(db)
+	asteriskService := services.NewAsteriskService(db)
 
 	// Initialize scheduler
 	checkScheduler := scheduler.NewCheckScheduler(db, checkService, phoneService, notificationService, cfg)
@@ -169,6 +170,9 @@ func main() {
 
 	// Notification routes
 	handlers.RegisterNotificationRoutes(protected, notificationService, authMiddleware)
+
+	// Asterisk routes (partially public)
+	handlers.RegisterAsteriskRoutes(api, asteriskService, authMiddleware)
 
 	// Health check
 	app.Get("/health", func(c *fiber.Ctx) error {

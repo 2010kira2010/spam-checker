@@ -277,3 +277,25 @@ const (
 	CheckModeAPIOnly CheckMode = "api_only"
 	CheckModeBoth    CheckMode = "both"
 )
+
+// NumberAllocation represents phone number allocation history
+type NumberAllocation struct {
+	ID            uint        `gorm:"primaryKey" json:"id"`
+	PhoneNumberID uint        `json:"phone_number_id"`
+	PhoneNumber   PhoneNumber `gorm:"foreignKey:PhoneNumberID" json:"phone_number"`
+	AllocatedTo   string      `json:"allocated_to"` // IP address or client identifier
+	Purpose       string      `json:"purpose"`      // Purpose of allocation
+	AllocatedAt   time.Time   `json:"allocated_at"`
+	Metadata      string      `gorm:"type:jsonb" json:"metadata,omitempty"` // Additional metadata
+	CreatedAt     time.Time   `json:"created_at"`
+}
+
+// PhoneNumberUsageStats represents usage statistics for load balancing
+type PhoneNumberUsageStats struct {
+	PhoneNumberID    uint       `json:"phone_number_id"`
+	Number           string     `json:"number"`
+	TotalAllocations int64      `json:"total_allocations"`
+	LastAllocatedAt  *time.Time `json:"last_allocated_at"`
+	DailyAllocations int64      `json:"daily_allocations"`
+	IsClean          bool       `json:"is_clean"`
+}

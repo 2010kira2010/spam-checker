@@ -52,6 +52,7 @@ func Migrate(db *gorm.DB) error {
 		&models.CheckSchedule{},
 		&models.SpamKeyword{},
 		&models.Statistics{},
+		&models.NumberAllocation{},
 	)
 	if err != nil {
 		return fmt.Errorf("failed to run migrations: %w", err)

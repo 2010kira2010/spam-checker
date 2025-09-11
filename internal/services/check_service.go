@@ -157,10 +157,10 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 	// Perform checks based on mode
 	switch checkMode {
 	case models.CheckModeADBOnly:
-		return s.checkViaADBWithRetry(&phone)
+		return s.checkViaADB(&phone)
 
 	case models.CheckModeAPIOnly:
-		return s.checkViaAPIWithRetry(&phone)
+		return s.checkViaAPI(&phone)
 
 	case models.CheckModeBoth:
 		// Check both ADB and API concurrently
@@ -168,14 +168,14 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 
 		go func() {
 			defer wg.Done()
-			if err := s.checkViaADBWithRetry(&phone); err != nil {
+			if err := s.checkViaADB(&phone); err != nil {
 				errChan <- fmt.Errorf("ADB: %w", err)
 			}
 		}()
 
 		go func() {
 			defer wg.Done()
-			if err := s.checkViaAPIWithRetry(&phone); err != nil {
+			if err := s.checkViaAPI(&phone); err != nil {
 				errChan <- fmt.Errorf("API: %w", err)
 			}
 		}()
@@ -201,10 +201,10 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 	}
 }
 
-// checkViaADBWithRetry checks phone via ADB with retry logic
-func (s *CheckService) checkViaADBWithRetry(phone *models.PhoneNumber) error {
+// checkViaADB checks phone via ADB without retry wrapper (to avoid recursion)
+func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 	log := s.log.WithFields(logrus.Fields{
-		"method": "checkViaADBWithRetry",
+		"method": "checkViaADB",
 		"phone":  phone.Number,
 	})
 
@@ -277,6 +277,133 @@ func (s *CheckService) checkViaADBWithRetry(phone *models.PhoneNumber) error {
 
 	if successCount == 0 && errorCount > 0 {
 		return fmt.Errorf("all ADB checks failed: %v", lastError)
+	}
+
+	return nil
+}
+
+// checkViaAPI checks phone via API without retry wrapper
+func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "checkViaAPI",
+		"phone":  phone.Number,
+	})
+
+	// Get active API services
+	apiServices, err := s.apiService.GetActiveAPIServices()
+	if err != nil {
+		return fmt.Errorf("failed to get active API services: %w", err)
+	}
+
+	if len(apiServices) == 0 {
+		return fmt.Errorf("no active API services available")
+	}
+
+	log.Infof("Starting API check for phone %s across %d services", phone.Number, len(apiServices))
+
+	// Create result channel
+	resultChan := make(chan APICheckResult, len(apiServices))
+	var wg sync.WaitGroup
+
+	// Check on each API service concurrently
+	for _, apiService := range apiServices {
+		wg.Add(1)
+		go func(api models.APIService) {
+			defer wg.Done()
+
+			result := APICheckResult{
+				PhoneID:    phone.ID,
+				APIService: &api,
+			}
+
+			// Perform check with retries
+			var checkResult *models.CheckResult
+			var lastErr error
+
+			for retry := 0; retry <= s.maxRetries; retry++ {
+				log.Infof("Checking phone %s via API %s (attempt %d/%d)",
+					phone.Number, api.Name, retry+1, s.maxRetries+1)
+
+				checkResult, err = s.apiService.CheckPhoneViaAPI(phone, &api)
+				if err != nil {
+					lastErr = err
+					if retry < s.maxRetries && s.isRetryableError(err) {
+						log.Warnf("API check failed, retrying: %v", err)
+						time.Sleep(s.retryDelay)
+						continue
+					}
+					result.Error = err
+					break
+				} else {
+					result.Result = checkResult
+
+					// Get service info after successful check
+					var service models.SpamService
+					if err := s.db.Where("code = ?", api.ServiceCode).First(&service).Error; err == nil {
+						result.Service = &service
+
+						// Update statistics in transaction
+						s.db.Transaction(func(tx *gorm.DB) error {
+							return s.updateStatisticsInTx(tx, phone.ID, service.ID, checkResult.IsSpam)
+						})
+					} else {
+						log.Warnf("Failed to get service after check: %v", err)
+					}
+
+					// Log extracted data for debugging
+					if checkResult.RawText != "" {
+						log.Debugf("API %s extracted text: %s", api.Name, checkResult.RawText)
+					}
+					if len(checkResult.FoundKeywords) > 0 {
+						log.Debugf("API %s found keywords: %v", api.Name, []string(checkResult.FoundKeywords))
+					}
+
+					break
+				}
+			}
+
+			// If all retries failed, set the last error
+			if checkResult == nil && lastErr != nil {
+				result.Error = lastErr
+			}
+
+			resultChan <- result
+		}(apiService)
+	}
+
+	// Close channel when all done
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	successCount := 0
+	errorCount := 0
+	var lastError error
+	hasSpamDetection := false
+
+	for result := range resultChan {
+		if result.Error != nil {
+			errorCount++
+			lastError = result.Error
+			log.Errorf("API check failed for %s: %v", result.APIService.Name, result.Error)
+		} else {
+			successCount++
+			log.Infof("API check succeeded for %s", result.APIService.Name)
+
+			// Check if any service detected spam
+			if result.Result != nil && result.Result.IsSpam {
+				hasSpamDetection = true
+			}
+		}
+	}
+
+	log.Infof("API check completed for phone %s: %d successful, %d failed, spam detected: %v",
+		phone.Number, successCount, errorCount, hasSpamDetection)
+
+	if successCount == 0 && errorCount > 0 {
+		return fmt.Errorf("all API checks failed: %v", lastError)
 	}
 
 	return nil
@@ -482,133 +609,6 @@ func (s *CheckService) processCheckResult(phone *models.PhoneNumber, service *mo
 
 	log.Infof("Check completed for %s on %s: isSpam=%v, keywords=%v",
 		phone.Number, service.Name, isSpam, foundKeywords)
-
-	return nil
-}
-
-// checkViaAPIWithRetry checks phone via API with retry logic
-func (s *CheckService) checkViaAPIWithRetry(phone *models.PhoneNumber) error {
-	log := s.log.WithFields(logrus.Fields{
-		"method": "checkViaAPIWithRetry",
-		"phone":  phone.Number,
-	})
-
-	// Get active API services
-	apiServices, err := s.apiService.GetActiveAPIServices()
-	if err != nil {
-		return fmt.Errorf("failed to get active API services: %w", err)
-	}
-
-	if len(apiServices) == 0 {
-		return fmt.Errorf("no active API services available")
-	}
-
-	log.Infof("Starting API check for phone %s across %d services", phone.Number, len(apiServices))
-
-	// Create result channel
-	resultChan := make(chan APICheckResult, len(apiServices))
-	var wg sync.WaitGroup
-
-	// Check on each API service concurrently
-	for _, apiService := range apiServices {
-		wg.Add(1)
-		go func(api models.APIService) {
-			defer wg.Done()
-
-			result := APICheckResult{
-				PhoneID:    phone.ID,
-				APIService: &api,
-			}
-
-			// Perform check with retries
-			var checkResult *models.CheckResult
-			var lastErr error
-
-			for retry := 0; retry <= s.maxRetries; retry++ {
-				log.Infof("Checking phone %s via API %s (attempt %d/%d)",
-					phone.Number, api.Name, retry+1, s.maxRetries+1)
-
-				checkResult, err = s.apiService.CheckPhoneViaAPI(phone, &api)
-				if err != nil {
-					lastErr = err
-					if retry < s.maxRetries && s.isRetryableError(err) {
-						log.Warnf("API check failed, retrying: %v", err)
-						time.Sleep(s.retryDelay)
-						continue
-					}
-					result.Error = err
-					break
-				} else {
-					result.Result = checkResult
-
-					// Get service info after successful check (it should be created by CheckPhoneViaAPI if needed)
-					var service models.SpamService
-					if err := s.db.Where("code = ?", api.ServiceCode).First(&service).Error; err == nil {
-						result.Service = &service
-
-						// Update statistics in transaction
-						s.db.Transaction(func(tx *gorm.DB) error {
-							return s.updateStatisticsInTx(tx, phone.ID, service.ID, checkResult.IsSpam)
-						})
-					} else {
-						log.Warnf("Failed to get service after check: %v", err)
-					}
-
-					// Log extracted data for debugging
-					if checkResult.RawText != "" {
-						log.Debugf("API %s extracted text: %s", api.Name, checkResult.RawText)
-					}
-					if len(checkResult.FoundKeywords) > 0 {
-						log.Debugf("API %s found keywords: %v", api.Name, []string(checkResult.FoundKeywords))
-					}
-
-					break
-				}
-			}
-
-			// If all retries failed, set the last error
-			if checkResult == nil && lastErr != nil {
-				result.Error = lastErr
-			}
-
-			resultChan <- result
-		}(apiService)
-	}
-
-	// Close channel when all done
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	// Collect results
-	successCount := 0
-	errorCount := 0
-	var lastError error
-	hasSpamDetection := false
-
-	for result := range resultChan {
-		if result.Error != nil {
-			errorCount++
-			lastError = result.Error
-			log.Errorf("API check failed for %s: %v", result.APIService.Name, result.Error)
-		} else {
-			successCount++
-			log.Infof("API check succeeded for %s", result.APIService.Name)
-
-			// Check if any service detected spam
-			if result.Result != nil && result.Result.IsSpam {
-				hasSpamDetection = true
-			}
-		}
-	}
-
-	log.Infof("API check completed for phone %s: %d successful, %d failed, spam detected: %v",
-		phone.Number, successCount, errorCount, hasSpamDetection)
-
-	if successCount == 0 && errorCount > 0 {
-		return fmt.Errorf("all API checks failed: %v", lastError)
-	}
 
 	return nil
 }
