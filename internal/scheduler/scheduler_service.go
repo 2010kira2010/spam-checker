@@ -31,11 +31,12 @@ type CheckScheduler struct {
 	runningMutex        sync.RWMutex
 	stopChan            chan struct{}
 
-	// Global check mutex to prevent concurrent checks
+	// Fixed: Single check control with proper timing
 	checkMutex       sync.Mutex
 	isCheckingNow    bool
 	lastCheckTime    time.Time
-	minCheckInterval time.Duration // Minimum time between checks
+	nextCheckTime    time.Time // Track when next check should occur
+	minCheckInterval time.Duration
 }
 
 func NewCheckScheduler(db *gorm.DB, checkService *services.CheckService, phoneService *services.PhoneService, notificationService *services.NotificationService, cfg *config.Config) *CheckScheduler {
@@ -52,7 +53,7 @@ func NewCheckScheduler(db *gorm.DB, checkService *services.CheckService, phoneSe
 		isRunning:           false,
 		stopChan:            make(chan struct{}),
 		isCheckingNow:       false,
-		minCheckInterval:    5 * time.Minute, // Minimum 5 minutes between checks
+		minCheckInterval:    5 * time.Minute,
 	}
 }
 
@@ -130,26 +131,55 @@ func (s *CheckScheduler) Stop() {
 	log.Info("Check scheduler stopped")
 }
 
-// canStartCheck checks if we can start a new check
+// canStartCheck checks if we can start a new check with improved timing logic
 func (s *CheckScheduler) canStartCheck() bool {
 	s.checkMutex.Lock()
 	defer s.checkMutex.Unlock()
 
+	now := time.Now()
+
 	// Check if already checking
 	if s.isCheckingNow {
-		s.log.Warn("Check already in progress, skipping")
+		s.log.WithFields(logrus.Fields{
+			"last_check": s.lastCheckTime.Format("15:04:05"),
+			"time_since": time.Since(s.lastCheckTime),
+		}).Warn("Check already in progress, skipping")
 		return false
 	}
 
-	// Check minimum interval
-	if time.Since(s.lastCheckTime) < s.minCheckInterval {
-		s.log.Warnf("Too soon since last check (%v ago), skipping", time.Since(s.lastCheckTime))
+	// Check if enough time has passed since last check
+	timeSinceLastCheck := now.Sub(s.lastCheckTime)
+	if timeSinceLastCheck < s.minCheckInterval {
+		s.log.WithFields(logrus.Fields{
+			"time_since":   timeSinceLastCheck,
+			"min_interval": s.minCheckInterval,
+			"next_allowed": s.lastCheckTime.Add(s.minCheckInterval).Format("15:04:05"),
+		}).Warn("Too soon since last check, skipping")
+		return false
+	}
+
+	// Check if we're before the scheduled next check time
+	if !s.nextCheckTime.IsZero() && now.Before(s.nextCheckTime) {
+		s.log.WithFields(logrus.Fields{
+			"next_scheduled": s.nextCheckTime.Format("15:04:05"),
+			"current_time":   now.Format("15:04:05"),
+		}).Debug("Not yet time for next check")
 		return false
 	}
 
 	// Mark as checking
 	s.isCheckingNow = true
-	s.lastCheckTime = time.Now()
+	s.lastCheckTime = now
+
+	// Calculate next check time based on current interval
+	if s.currentInterval > 0 {
+		s.nextCheckTime = now.Add(time.Duration(s.currentInterval) * time.Minute)
+		s.log.WithFields(logrus.Fields{
+			"next_check": s.nextCheckTime.Format("15:04:05"),
+			"interval":   s.currentInterval,
+		}).Info("Next check scheduled")
+	}
+
 	return true
 }
 
@@ -234,7 +264,7 @@ func (s *CheckScheduler) performPhoneCheck(checkType string, scheduleID uint) {
 	log.Infof("Starting check for %d phones", len(phones))
 
 	// Track all results for single notification
-	allResults := make(map[uint][]models.CheckResult)
+	allResults := make(map[uint]*PhoneCheckSummary)
 	totalSpamCount := 0
 	successCount := 0
 	var checkErrors []error
@@ -258,10 +288,9 @@ func (s *CheckScheduler) performPhoneCheck(checkType string, scheduleID uint) {
 		select {
 		case err := <-checkDone:
 			if err != nil {
-				// Check if it's a "already checking" error
+				// Check if it's a "already checking" error - don't count as error
 				if strings.Contains(err.Error(), "already being checked") {
 					log.Debugf("Phone %s is already being checked by another process", phone.Number)
-					// Don't count this as an error
 				} else {
 					log.Errorf("Failed to check phone %s: %v", phone.Number, err)
 					checkErrors = append(checkErrors, err)
@@ -269,16 +298,11 @@ func (s *CheckScheduler) performPhoneCheck(checkType string, scheduleID uint) {
 			} else {
 				successCount++
 				// Get latest results for this phone
-				checkResults, err := s.checkService.GetCheckResults(phone.ID, 0, 10)
-				if err == nil && len(checkResults) > 0 {
-					allResults[phone.ID] = checkResults
-
-					// Check if any service detected spam
-					for _, result := range checkResults {
-						if result.IsSpam {
-							totalSpamCount++
-							break // Count each phone only once
-						}
+				summary := s.getPhoneSummary(phone.ID)
+				if summary != nil {
+					allResults[phone.ID] = summary
+					if summary.IsSpam {
+						totalSpamCount++
 					}
 				}
 			}
@@ -290,7 +314,7 @@ func (s *CheckScheduler) performPhoneCheck(checkType string, scheduleID uint) {
 			return
 		}
 
-		// Small delay between checks
+		// Small delay between checks to avoid overwhelming the system
 		time.Sleep(1 * time.Second)
 	}
 
@@ -307,8 +331,71 @@ func (s *CheckScheduler) performPhoneCheck(checkType string, scheduleID uint) {
 	}
 }
 
+// PhoneCheckSummary holds summary of check results for a phone
+type PhoneCheckSummary struct {
+	PhoneNumber string
+	IsSpam      bool
+	Services    map[string]*ServiceResult
+}
+
+// ServiceResult holds result for a specific service
+type ServiceResult struct {
+	IsSpam   bool
+	Keywords []string
+}
+
+// getPhoneSummary gets summary of latest check results for a phone
+func (s *CheckScheduler) getPhoneSummary(phoneID uint) *PhoneCheckSummary {
+	// Get phone details
+	var phone models.PhoneNumber
+	if err := s.db.First(&phone, phoneID).Error; err != nil {
+		return nil
+	}
+
+	summary := &PhoneCheckSummary{
+		PhoneNumber: phone.Number,
+		Services:    make(map[string]*ServiceResult),
+	}
+
+	// Get latest check results grouped by service
+	var results []models.CheckResult
+	subQuery := s.db.Model(&models.CheckResult{}).
+		Select("MAX(id) as id").
+		Where("phone_number_id = ?", phoneID).
+		Group("service_id")
+
+	err := s.db.
+		Where("id IN (?)", subQuery).
+		Preload("Service").
+		Find(&results).Error
+
+	if err != nil {
+		s.log.Errorf("Failed to get check results for phone %d: %v", phoneID, err)
+		return summary
+	}
+
+	// Process results
+	for _, result := range results {
+		serviceName := result.Service.Name
+		if serviceName == "" {
+			continue
+		}
+
+		summary.Services[serviceName] = &ServiceResult{
+			IsSpam:   result.IsSpam,
+			Keywords: []string(result.FoundKeywords),
+		}
+
+		if result.IsSpam {
+			summary.IsSpam = true
+		}
+	}
+
+	return summary
+}
+
 // sendConsolidatedNotification sends a single notification with all results
-func (s *CheckScheduler) sendConsolidatedNotification(checkType string, scheduleID uint, spamCount, totalCount int, results map[uint][]models.CheckResult) {
+func (s *CheckScheduler) sendConsolidatedNotification(checkType string, scheduleID uint, spamCount, totalCount int, results map[uint]*PhoneCheckSummary) {
 	log := s.log.WithFields(logrus.Fields{
 		"method": "sendConsolidatedNotification",
 	})
@@ -337,24 +424,15 @@ func (s *CheckScheduler) sendConsolidatedNotification(checkType string, schedule
 	// Group spam results by service
 	serviceSpamMap := make(map[string][]string)
 
-	for phoneID, checkResults := range results {
-		for _, result := range checkResults {
-			if result.IsSpam {
-				var phone models.PhoneNumber
-				if err := s.db.First(&phone, phoneID).Error; err == nil {
-					serviceName := result.Service.Name
-					if serviceName == "" {
-						// Load service if not preloaded
-						var service models.SpamService
-						if err := s.db.First(&service, result.ServiceID).Error; err == nil {
-							serviceName = service.Name
-						}
-					}
+	for _, summary := range results {
+		if !summary.IsSpam {
+			continue
+		}
 
-					keywords := []string(result.FoundKeywords)
-					phoneInfo := fmt.Sprintf("%s: %v", phone.Number, keywords)
-					serviceSpamMap[serviceName] = append(serviceSpamMap[serviceName], phoneInfo)
-				}
+		for serviceName, result := range summary.Services {
+			if result.IsSpam {
+				phoneInfo := fmt.Sprintf("%s: %v", summary.PhoneNumber, result.Keywords)
+				serviceSpamMap[serviceName] = append(serviceSpamMap[serviceName], phoneInfo)
 			}
 		}
 	}
@@ -446,6 +524,11 @@ func (s *CheckScheduler) updateDefaultIntervalCheck(intervalMinutes int) {
 		minInterval = 5 * time.Minute
 	}
 	s.minCheckInterval = minInterval
+
+	// Set next check time
+	s.checkMutex.Lock()
+	s.nextCheckTime = time.Now().Add(time.Duration(intervalMinutes) * time.Minute)
+	s.checkMutex.Unlock()
 
 	log.Infof("Setting default interval check to every %d minutes (min interval: %v)", intervalMinutes, minInterval)
 
@@ -637,14 +720,20 @@ func (s *CheckScheduler) GetScheduleStatus() []map[string]interface{} {
 		intervalMinutes = 60
 	}
 
+	s.checkMutex.Lock()
+	nextCheck := s.nextCheckTime
+	lastCheck := s.lastCheckTime
+	isChecking := s.isCheckingNow
+	s.checkMutex.Unlock()
+
 	status = append(status, map[string]interface{}{
 		"id":         0,
 		"name":       "Default Interval Check",
 		"expression": fmt.Sprintf("Every %d minutes", intervalMinutes),
 		"is_active":  s.defaultIntervalJob != nil,
-		"last_run":   s.lastCheckTime,
-		"next_run":   nil,
-		"is_running": s.isCheckingNow,
+		"last_run":   lastCheck,
+		"next_run":   nextCheck,
+		"is_running": isChecking,
 		"is_default": true,
 	})
 
