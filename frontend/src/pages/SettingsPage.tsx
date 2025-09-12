@@ -40,6 +40,9 @@ import {
     LinearProgress,
     Collapse,
     InputAdornment,
+    FormGroup,
+    Checkbox,
+    FormLabel,
 } from '@mui/material';
 import {
     Settings as SettingsIcon,
@@ -69,9 +72,14 @@ import {
     CheckCircle as CheckCircleIcon,
     Error as ErrorIcon,
     Info as InfoIcon,
+    AccessTime,
+    CalendarMonth,
 } from '@mui/icons-material';
 import { useSnackbar } from 'notistack';
 import axios from 'axios';
+import { TimePicker } from '@mui/x-date-pickers/TimePicker';
+import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
+import { LocalizationProvider } from '@mui/x-date-pickers';
 
 interface GeneralSettings {
     check_interval_minutes: number;
@@ -209,6 +217,13 @@ const SettingsPage: React.FC = observer(() => {
     const [schedules, setSchedules] = useState<CheckSchedule[]>([]);
     const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
     const [editingSchedule, setEditingSchedule] = useState<CheckSchedule | null>(null);
+    const [scheduleType, setScheduleType] = useState<'preset' | 'custom' | 'advanced'>('preset');
+    const [customCronExpression, setCustomCronExpression] = useState('');
+    const [advancedSchedule, setAdvancedSchedule] = useState({
+        frequency: 'daily' as 'daily' | 'weekly',
+        time: new Date(),
+        weekdays: [] as number[],
+    });
 
     // Notifications
     const [notifications, setNotifications] = useState<Notification[]>([]);
@@ -574,24 +589,91 @@ const SettingsPage: React.FC = observer(() => {
             cron_expression: '@hourly',
             is_active: true,
         });
+        setScheduleType('preset');
+        setCustomCronExpression('');
+        setAdvancedSchedule({
+            frequency: 'daily',
+            time: new Date(),
+            weekdays: [],
+        });
         setScheduleDialogOpen(true);
     };
 
     const handleEditSchedule = (schedule: CheckSchedule) => {
         setEditingSchedule(schedule);
+
+        // Determine schedule type from cron expression
+        if (schedule.cron_expression.startsWith('@')) {
+            setScheduleType('preset');
+        } else if (schedule.cron_expression.startsWith('DAILY:') || schedule.cron_expression.startsWith('WEEKLY:')) {
+            setScheduleType('advanced');
+            // Parse advanced schedule
+            if (schedule.cron_expression.startsWith('DAILY:')) {
+                const timeParts = schedule.cron_expression.replace('DAILY:', '').split(':');
+                const hour = parseInt(timeParts[0]);
+                const minute = parseInt(timeParts[1]);
+                const time = new Date();
+                time.setHours(hour, minute, 0, 0);
+                setAdvancedSchedule({
+                    frequency: 'daily',
+                    time: time,
+                    weekdays: [],
+                });
+            } else if (schedule.cron_expression.startsWith('WEEKLY:')) {
+                const parts = schedule.cron_expression.replace('WEEKLY:', '').split(':');
+                const weekdays = parts[0].split(',').map(d => parseInt(d));
+                const hour = parseInt(parts[1]);
+                const minute = parseInt(parts[2]);
+                const time = new Date();
+                time.setHours(hour, minute, 0, 0);
+                setAdvancedSchedule({
+                    frequency: 'weekly',
+                    time: time,
+                    weekdays: weekdays,
+                });
+            }
+        } else {
+            setScheduleType('custom');
+            setCustomCronExpression(schedule.cron_expression);
+        }
+
         setScheduleDialogOpen(true);
     };
 
     const handleSaveSchedule = async () => {
         if (!editingSchedule) return;
 
+        // Build cron expression based on schedule type
+        let cronExpression = editingSchedule.cron_expression;
+
+        if (scheduleType === 'custom') {
+            cronExpression = customCronExpression;
+        } else if (scheduleType === 'advanced') {
+            const hours = advancedSchedule.time.getHours();
+            const minutes = advancedSchedule.time.getMinutes();
+
+            if (advancedSchedule.frequency === 'daily') {
+                cronExpression = `DAILY:${hours}:${minutes}`;
+            } else if (advancedSchedule.frequency === 'weekly' && advancedSchedule.weekdays.length > 0) {
+                cronExpression = `WEEKLY:${advancedSchedule.weekdays.join(',')}:${hours}:${minutes}`;
+            } else {
+                enqueueSnackbar('Please select at least one weekday for weekly schedule', { variant: 'error' });
+                return;
+            }
+        }
+
+        const scheduleData = {
+            ...editingSchedule,
+            cron_expression: cronExpression,
+        };
+
         try {
             if (editingSchedule.id === 0) {
-                const res = await axios.post('/settings/schedules', editingSchedule);
+                const res = await axios.post('/settings/schedules', scheduleData);
                 setSchedules([...schedules, res.data]);
             } else {
-                await axios.put(`/settings/schedules/${editingSchedule.id}`, editingSchedule);
-                setSchedules(schedules.map(s => s.id === editingSchedule.id ? editingSchedule : s));
+                await axios.put(`/settings/schedules/${editingSchedule.id}`, scheduleData);
+                setSchedules(schedules.map(s => s.id === editingSchedule.id ? { ...editingSchedule, cron_expression: cronExpression } : s));
             }
             setScheduleDialogOpen(false);
             enqueueSnackbar(t('common.success'), { variant: 'success' });
@@ -785,6 +867,42 @@ const SettingsPage: React.FC = observer(() => {
             return false;
         }
     };
+
+    const formatScheduleExpression = (expression: string) => {
+        if (expression.startsWith('@')) {
+            switch (expression) {
+                case '@hourly':
+                    return 'Every hour';
+                case '@daily':
+                    return 'Every day';
+                case '@weekly':
+                    return 'Every week';
+                default:
+                    return expression;
+            }
+        } else if (expression.startsWith('DAILY:')) {
+            const timeParts = expression.replace('DAILY:', '').split(':');
+            return `Daily at ${timeParts[0].padStart(2, '0')}:${timeParts[1].padStart(2, '0')}`;
+        } else if (expression.startsWith('WEEKLY:')) {
+            const parts = expression.replace('WEEKLY:', '').split(':');
+            const weekdays = parts[0].split(',').map(d => {
+                const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+                return days[parseInt(d)];
+            }).join(', ');
+            return `Weekly on ${weekdays} at ${parts[1].padStart(2, '0')}:${parts[2].padStart(2, '0')}`;
+        }
+        return expression;
+    };
+
+    const weekDays = [
+        { value: 0, label: 'Sunday' },
+        { value: 1, label: 'Monday' },
+        { value: 2, label: 'Tuesday' },
+        { value: 3, label: 'Wednesday' },
+        { value: 4, label: 'Thursday' },
+        { value: 5, label: 'Friday' },
+        { value: 6, label: 'Saturday' },
+    ];
 
     return (
         <Box>
@@ -1249,8 +1367,18 @@ const SettingsPage: React.FC = observer(() => {
                                 {schedules.map((schedule) => (
                                     <ListItem key={schedule.id} sx={{ bgcolor: 'background.paper', mb: 1, borderRadius: 1 }}>
                                         <ListItemText
-                                            primary={schedule.name}
-                                            secondary={`${t('settings.expression')}: ${schedule.cron_expression}${schedule.last_run ? ` • ${t('settings.lastRun')}: ${new Date(schedule.last_run).toLocaleString()}` : ''}`}
+                                            primary={
+                                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                                    <Typography variant="subtitle1">{schedule.name}</Typography>
+                                                    {schedule.cron_expression.startsWith('DAILY:') && (
+                                                        <Chip icon={<AccessTime />} label="Daily" size="small" color="info" />
+                                                    )}
+                                                    {schedule.cron_expression.startsWith('WEEKLY:') && (
+                                                        <Chip icon={<CalendarMonth />} label="Weekly" size="small" color="success" />
+                                                    )}
+                                                </Box>
+                                            }
+                                            secondary={`${t('settings.expression')}: ${formatScheduleExpression(schedule.cron_expression)}${schedule.last_run ? ` • ${t('settings.lastRun')}: ${new Date(schedule.last_run).toLocaleString()}` : ''}`}
                                         />
                                         <ListItemSecondaryAction>
                                             <FormControlLabel
@@ -1317,6 +1445,215 @@ const SettingsPage: React.FC = observer(() => {
                     </CardContent>
                 </Card>
             )}
+
+            {/* Schedule Dialog */}
+            <Dialog open={scheduleDialogOpen} onClose={() => setScheduleDialogOpen(false)} maxWidth="sm" fullWidth>
+                <DialogTitle>{editingSchedule?.id === 0 ? t('settings.addSchedule') : t('settings.editSchedule')}</DialogTitle>
+                <DialogContent>
+                    <LocalizationProvider dateAdapter={AdapterDateFns}>
+                        <Grid container spacing={2} sx={{ mt: 1 }}>
+                            <Grid item xs={12}>
+                                <TextField
+                                    fullWidth
+                                    label={t('settings.scheduleName')}
+                                    value={editingSchedule?.name || ''}
+                                    onChange={(e) => setEditingSchedule(editingSchedule ? { ...editingSchedule, name: e.target.value } : null)}
+                                />
+                            </Grid>
+
+                            <Grid item xs={12}>
+                                <FormControl component="fieldset">
+                                    <FormLabel component="legend">Schedule Type</FormLabel>
+                                    <RadioGroup
+                                        value={scheduleType}
+                                        onChange={(e) => setScheduleType(e.target.value as 'preset' | 'custom' | 'advanced')}
+                                    >
+                                        <FormControlLabel
+                                            value="preset"
+                                            control={<Radio />}
+                                            label="Preset Intervals"
+                                        />
+                                        <FormControlLabel
+                                            value="advanced"
+                                            control={<Radio />}
+                                            label="Specific Time & Day"
+                                        />
+                                        <FormControlLabel
+                                            value="custom"
+                                            control={<Radio />}
+                                            label="Custom Cron Expression"
+                                        />
+                                    </RadioGroup>
+                                </FormControl>
+                            </Grid>
+
+                            {scheduleType === 'preset' && (
+                                <Grid item xs={12}>
+                                    <FormControl fullWidth>
+                                        <InputLabel>{t('settings.cronExpression')}</InputLabel>
+                                        <Select
+                                            value={editingSchedule?.cron_expression || '@hourly'}
+                                            label={t('settings.cronExpression')}
+                                            onChange={(e) => setEditingSchedule(editingSchedule ? { ...editingSchedule, cron_expression: e.target.value } : null)}
+                                        >
+                                            <MenuItem value="@hourly">Every hour</MenuItem>
+                                            <MenuItem value="@daily">Every day</MenuItem>
+                                            <MenuItem value="@weekly">Every week</MenuItem>
+                                            <MenuItem value="0 */6 * * *">Every 6 hours</MenuItem>
+                                            <MenuItem value="0 */12 * * *">Every 12 hours</MenuItem>
+                                            <MenuItem value="*/30 * * * *">Every 30 minutes</MenuItem>
+                                            <MenuItem value="*/15 * * * *">Every 15 minutes</MenuItem>
+                                        </Select>
+                                    </FormControl>
+                                </Grid>
+                            )}
+
+                            {scheduleType === 'advanced' && (
+                                <>
+                                    <Grid item xs={12}>
+                                        <FormControl component="fieldset">
+                                            <FormLabel component="legend">Frequency</FormLabel>
+                                            <RadioGroup
+                                                value={advancedSchedule.frequency}
+                                                onChange={(e) => setAdvancedSchedule({ ...advancedSchedule, frequency: e.target.value as 'daily' | 'weekly' })}
+                                            >
+                                                <FormControlLabel
+                                                    value="daily"
+                                                    control={<Radio />}
+                                                    label="Daily at specific time"
+                                                />
+                                                <FormControlLabel
+                                                    value="weekly"
+                                                    control={<Radio />}
+                                                    label="Weekly on specific days"
+                                                />
+                                            </RadioGroup>
+                                        </FormControl>
+                                    </Grid>
+
+                                    <Grid item xs={12}>
+                                        <TimePicker
+                                            label="Time"
+                                            value={advancedSchedule.time}
+                                            onChange={(newValue) => {
+                                                if (newValue) {
+                                                    setAdvancedSchedule({ ...advancedSchedule, time: newValue });
+                                                }
+                                            }}
+                                            slotProps={{
+                                                textField: {
+                                                    fullWidth: true,
+                                                    required: true,
+                                                },
+                                            }}
+                                        />
+                                    </Grid>
+
+                                    {advancedSchedule.frequency === 'weekly' && (
+                                        <Grid item xs={12}>
+                                            <FormControl component="fieldset">
+                                                <FormLabel component="legend">Select Days of Week</FormLabel>
+                                                <FormGroup row>
+                                                    {weekDays.map((day) => (
+                                                        <FormControlLabel
+                                                            key={day.value}
+                                                            control={
+                                                                <Checkbox
+                                                                    checked={advancedSchedule.weekdays.includes(day.value)}
+                                                                    onChange={(e) => {
+                                                                        if (e.target.checked) {
+                                                                            setAdvancedSchedule({
+                                                                                ...advancedSchedule,
+                                                                                weekdays: [...advancedSchedule.weekdays, day.value].sort(),
+                                                                            });
+                                                                        } else {
+                                                                            setAdvancedSchedule({
+                                                                                ...advancedSchedule,
+                                                                                weekdays: advancedSchedule.weekdays.filter(d => d !== day.value),
+                                                                            });
+                                                                        }
+                                                                    }}
+                                                                />
+                                                            }
+                                                            label={day.label}
+                                                        />
+                                                    ))}
+                                                </FormGroup>
+                                                {advancedSchedule.frequency === 'weekly' && advancedSchedule.weekdays.length === 0 && (
+                                                    <Typography variant="caption" color="error">
+                                                        Please select at least one day
+                                                    </Typography>
+                                                )}
+                                            </FormControl>
+                                        </Grid>
+                                    )}
+
+                                    {/* Preview */}
+                                    <Grid item xs={12}>
+                                        <Alert severity="info" icon={<InfoIcon />}>
+                                            <Typography variant="body2">
+                                                <strong>Schedule Preview:</strong>{' '}
+                                                {advancedSchedule.frequency === 'daily'
+                                                    ? `Every day at ${advancedSchedule.time.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}`
+                                                    : advancedSchedule.weekdays.length > 0
+                                                        ? `Every ${advancedSchedule.weekdays.map(d => weekDays.find(wd => wd.value === d)?.label).join(', ')} at ${advancedSchedule.time.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}`
+                                                        : 'Please select days and time'
+                                                }
+                                            </Typography>
+                                        </Alert>
+                                    </Grid>
+                                </>
+                            )}
+
+                            {scheduleType === 'custom' && (
+                                <>
+                                    <Grid item xs={12}>
+                                        <TextField
+                                            fullWidth
+                                            label="Cron Expression"
+                                            value={customCronExpression}
+                                            onChange={(e) => setCustomCronExpression(e.target.value)}
+                                            placeholder="0 */6 * * *"
+                                            helperText="Enter a valid cron expression (e.g., '0 14 * * 1-5' for weekdays at 2 PM)"
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12}>
+                                        <Alert severity="info">
+                                            <Typography variant="caption">
+                                                <strong>Cron Expression Format:</strong><br />
+                                                Minute (0-59) Hour (0-23) Day (1-31) Month (1-12) Weekday (0-6, 0=Sunday)<br />
+                                                <strong>Examples:</strong><br />
+                                                • "0 9 * * 1-5" - Monday to Friday at 9:00 AM<br />
+                                                • "*/30 * * * *" - Every 30 minutes<br />
+                                                • "0 */4 * * *" - Every 4 hours<br />
+                                                • "0 14 * * 1,3,5" - Monday, Wednesday, Friday at 2:00 PM
+                                            </Typography>
+                                        </Alert>
+                                    </Grid>
+                                </>
+                            )}
+
+                            <Grid item xs={12}>
+                                <FormControlLabel
+                                    control={
+                                        <Switch
+                                            checked={editingSchedule?.is_active || false}
+                                            onChange={(e) => setEditingSchedule(editingSchedule ? { ...editingSchedule, is_active: e.target.checked } : null)}
+                                        />
+                                    }
+                                    label={t('common.active')}
+                                />
+                            </Grid>
+                        </Grid>
+                    </LocalizationProvider>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setScheduleDialogOpen(false)}>{t('common.cancel')}</Button>
+                    <Button onClick={handleSaveSchedule} variant="contained">{t('common.save')}</Button>
+                </DialogActions>
+            </Dialog>
+
+            {/* Other existing dialogs remain unchanged */}
 
             {/* API Service Dialog */}
             <Dialog open={apiDialogOpen} onClose={() => setApiDialogOpen(false)} maxWidth="md" fullWidth>
@@ -1442,34 +1779,6 @@ const SettingsPage: React.FC = observer(() => {
                                     }
                                     label={t('settings.apiServiceDialogActive')}
                                 />
-                            </Grid>
-                            <Grid item xs={12}>
-                                <Alert severity="info" icon={<InfoIcon />}>
-                                    <Typography variant="subtitle2" sx={{ mb: 1 }}>{t('settings.apiServiceDialogExampleConfigs')}</Typography>
-                                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                                        {Object.entries(exampleConfigs).map(([name, config]) => (
-                                            <Button
-                                                key={name}
-                                                size="small"
-                                                variant="outlined"
-                                                startIcon={<ContentCopy />}
-                                                onClick={() => {
-                                                    if (editingApiService) {
-                                                        setEditingApiService({
-                                                            ...editingApiService,
-                                                            headers: JSON.stringify(config.headers, null, 2),
-                                                            response_path: config.response_path || '',
-                                                            keyword_paths: config.keyword_paths || '',
-                                                        });
-                                                        enqueueSnackbar(t('settings.apiServiceDialogConfigLoaded', { name: name.charAt(0).toUpperCase() + name.slice(1) }), { variant: 'info' });
-                                                    }
-                                                }}
-                                            >
-                                                {name.charAt(0).toUpperCase() + name.slice(1)}
-                                            </Button>
-                                        ))}
-                                    </Box>
-                                </Alert>
                             </Grid>
                         </Grid>
                     </Box>
@@ -1669,54 +1978,6 @@ const SettingsPage: React.FC = observer(() => {
                 <DialogActions>
                     <Button onClick={() => setKeywordDialogOpen(false)}>{t('common.cancel')}</Button>
                     <Button onClick={handleSaveKeyword} variant="contained">{t('common.save')}</Button>
-                </DialogActions>
-            </Dialog>
-
-            {/* Schedule Dialog */}
-            <Dialog open={scheduleDialogOpen} onClose={() => setScheduleDialogOpen(false)} maxWidth="sm" fullWidth>
-                <DialogTitle>{editingSchedule?.id === 0 ? t('settings.addSchedule') : t('settings.editSchedule')}</DialogTitle>
-                <DialogContent>
-                    <Grid container spacing={2} sx={{ mt: 1 }}>
-                        <Grid item xs={12}>
-                            <TextField
-                                fullWidth
-                                label={t('settings.scheduleName')}
-                                value={editingSchedule?.name || ''}
-                                onChange={(e) => setEditingSchedule(editingSchedule ? { ...editingSchedule, name: e.target.value } : null)}
-                            />
-                        </Grid>
-                        <Grid item xs={12}>
-                            <FormControl fullWidth>
-                                <InputLabel>{t('settings.cronExpression')}</InputLabel>
-                                <Select
-                                    value={editingSchedule?.cron_expression || '@hourly'}
-                                    label={t('settings.cronExpression')}
-                                    onChange={(e) => setEditingSchedule(editingSchedule ? { ...editingSchedule, cron_expression: e.target.value } : null)}
-                                >
-                                    <MenuItem value="@hourly">Every hour</MenuItem>
-                                    <MenuItem value="@daily">Every day</MenuItem>
-                                    <MenuItem value="@weekly">Every week</MenuItem>
-                                    <MenuItem value="0 */6 * * *">Every 6 hours</MenuItem>
-                                    <MenuItem value="0 */12 * * *">Every 12 hours</MenuItem>
-                                </Select>
-                            </FormControl>
-                        </Grid>
-                        <Grid item xs={12}>
-                            <FormControlLabel
-                                control={
-                                    <Switch
-                                        checked={editingSchedule?.is_active || false}
-                                        onChange={(e) => setEditingSchedule(editingSchedule ? { ...editingSchedule, is_active: e.target.checked } : null)}
-                                    />
-                                }
-                                label={t('common.active')}
-                            />
-                        </Grid>
-                    </Grid>
-                </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setScheduleDialogOpen(false)}>{t('common.cancel')}</Button>
-                    <Button onClick={handleSaveSchedule} variant="contained">{t('common.save')}</Button>
                 </DialogActions>
             </Dialog>
 
