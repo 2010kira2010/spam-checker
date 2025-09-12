@@ -132,6 +132,7 @@ func (s *CheckScheduler) Stop() {
 }
 
 // canStartCheck checks if we can start a new check with improved timing logic
+// This is primarily used for the default interval check, not scheduled checks
 func (s *CheckScheduler) canStartCheck() bool {
 	s.checkMutex.Lock()
 	defer s.checkMutex.Unlock()
@@ -158,7 +159,7 @@ func (s *CheckScheduler) canStartCheck() bool {
 		return false
 	}
 
-	// Check if we're before the scheduled next check time
+	// Check if we're before the scheduled next check time (for default interval check only)
 	if !s.nextCheckTime.IsZero() && now.Before(s.nextCheckTime) {
 		s.log.WithFields(logrus.Fields{
 			"next_scheduled": s.nextCheckTime.Format("15:04:05"),
@@ -171,13 +172,13 @@ func (s *CheckScheduler) canStartCheck() bool {
 	s.isCheckingNow = true
 	s.lastCheckTime = now
 
-	// Calculate next check time based on current interval
+	// Calculate next check time based on current interval (for default check)
 	if s.currentInterval > 0 {
 		s.nextCheckTime = now.Add(time.Duration(s.currentInterval) * time.Minute)
 		s.log.WithFields(logrus.Fields{
 			"next_check": s.nextCheckTime.Format("15:04:05"),
 			"interval":   s.currentInterval,
-		}).Info("Next check scheduled")
+		}).Info("Next default check scheduled")
 	}
 
 	return true
@@ -215,13 +216,36 @@ func (s *CheckScheduler) runScheduledCheck(scheduleID uint) {
 		"scheduleID": scheduleID,
 	})
 
-	// Check if we can start
-	if !s.canStartCheck() {
+	// Get schedule details for logging
+	var schedule models.CheckSchedule
+	if err := s.db.First(&schedule, scheduleID).Error; err == nil {
+		log = log.WithFields(logrus.Fields{
+			"scheduleName": schedule.Name,
+			"expression":   schedule.CronExpression,
+		})
+	}
+
+	// For scheduled checks, we don't use canStartCheck() because
+	// they should run independently of the default interval check
+	s.checkMutex.Lock()
+	if s.isCheckingNow {
+		s.checkMutex.Unlock()
+		log.Warn("Another check is already in progress, skipping scheduled check")
 		return
 	}
-	defer s.markCheckComplete()
 
-	log.Infof("Starting scheduled check ID: %d", scheduleID)
+	// Mark as checking
+	s.isCheckingNow = true
+	s.lastCheckTime = time.Now()
+	s.checkMutex.Unlock()
+
+	defer func() {
+		s.checkMutex.Lock()
+		s.isCheckingNow = false
+		s.checkMutex.Unlock()
+	}()
+
+	log.Infof("Starting scheduled check ID: %d (%s)", scheduleID, schedule.Name)
 
 	// Update last run time
 	now := time.Now()
@@ -236,6 +260,7 @@ func (s *CheckScheduler) runScheduledCheck(scheduleID uint) {
 	if job, exists := s.jobs[scheduleID]; exists {
 		nextRun := job.NextScheduledTime()
 		s.db.Model(&models.CheckSchedule{}).Where("id = ?", scheduleID).Update("next_run", &nextRun)
+		log.Infof("Scheduled check completed. Next run scheduled for: %s", nextRun.Format("2006-01-02 15:04:05"))
 	}
 }
 
@@ -400,6 +425,36 @@ func (s *CheckScheduler) sendConsolidatedNotification(checkType string, schedule
 		"method": "sendConsolidatedNotification",
 	})
 
+	// Check if notifications are enabled
+	var enableNotificationsSetting models.SystemSettings
+	enableNotifications := true // Default to true
+
+	if err := s.db.Where("key = ?", "enable_notifications").First(&enableNotificationsSetting).Error; err == nil {
+		if enableNotificationsSetting.Value == "false" || enableNotificationsSetting.Value == "0" {
+			enableNotifications = false
+		}
+	}
+
+	if !enableNotifications {
+		log.Debug("Notifications are disabled in settings")
+		return
+	}
+
+	// Check if notifications for spam detection are enabled
+	var notifyOnSpamSetting models.SystemSettings
+	notifyOnSpam := true // Default to true
+
+	if err := s.db.Where("key = ?", "notify_on_spam_detection").First(&notifyOnSpamSetting).Error; err == nil {
+		if notifyOnSpamSetting.Value == "false" || notifyOnSpamSetting.Value == "0" {
+			notifyOnSpam = false
+		}
+	}
+
+	if !notifyOnSpam {
+		log.Debug("Spam detection notifications are disabled")
+		return
+	}
+
 	// Build notification message
 	var title string
 	if checkType == "scheduled" && scheduleID > 0 {
@@ -448,12 +503,47 @@ func (s *CheckScheduler) sendConsolidatedNotification(checkType string, schedule
 		}
 	}
 
-	// Send notification
+	// Send notification with error handling
 	if err := s.notificationService.SendNotification(title, message); err != nil {
-		log.Errorf("Failed to send notification: %v", err)
+		// Check if it's a critical error or just a temporary issue
+		if strings.Contains(err.Error(), "all notifications failed") {
+			log.Errorf("All notification channels failed: %v", err)
+		} else if strings.Contains(err.Error(), "config issue") {
+			log.Warnf("Notification configuration issue: %v", err)
+		} else {
+			log.Warnf("Some notifications may have failed: %v", err)
+		}
+
+		// Don't fail the entire check process because of notification errors
+		// The check results are already saved in the database
 	} else {
 		log.Info("Notification sent successfully")
 	}
+}
+
+// Helper function to check if we should send notifications for this check type
+func (s *CheckScheduler) shouldSendNotification(checkType string, scheduleID uint) bool {
+	// Check global notification setting
+	var enableNotificationsSetting models.SystemSettings
+	if err := s.db.Where("key = ?", "enable_notifications").First(&enableNotificationsSetting).Error; err == nil {
+		if enableNotificationsSetting.Value == "false" || enableNotificationsSetting.Value == "0" {
+			return false
+		}
+	}
+
+	// Check specific settings for check type
+	switch checkType {
+	case "default":
+		var notifyDefaultSetting models.SystemSettings
+		if err := s.db.Where("key = ?", "notify_default_checks").First(&notifyDefaultSetting).Error; err == nil {
+			return notifyDefaultSetting.Value != "false" && notifyDefaultSetting.Value != "0"
+		}
+	case "scheduled":
+		// Could check per-schedule notification settings here if needed
+		return true
+	}
+
+	return true
 }
 
 // checkForConfigurationChanges checks if configuration has changed and reloads if necessary
@@ -586,7 +676,8 @@ func (s *CheckScheduler) AddSchedule(schedule *models.CheckSchedule) error {
 	nextRun := job.NextScheduledTime()
 	s.db.Model(schedule).Update("next_run", &nextRun)
 
-	log.Infof("Added schedule: %s (%s)", schedule.Name, schedule.CronExpression)
+	log.Infof("Added schedule: %s (%s), next run: %s",
+		schedule.Name, schedule.CronExpression, nextRun.Format("2006-01-02 15:04:05"))
 
 	return nil
 }
@@ -618,6 +709,8 @@ func (s *CheckScheduler) reloadCustomSchedules() {
 		return
 	}
 
+	log.Debugf("Found %d schedules in database", len(schedules))
+
 	// Track which schedules are in DB
 	schedulesInDB := make(map[uint]bool)
 
@@ -634,6 +727,8 @@ func (s *CheckScheduler) reloadCustomSchedules() {
 				} else {
 					log.Infof("Added new schedule: %s", schedule.Name)
 				}
+			} else {
+				log.Debugf("Schedule %s already active", schedule.Name)
 			}
 		} else {
 			// Schedule is inactive
@@ -652,6 +747,16 @@ func (s *CheckScheduler) reloadCustomSchedules() {
 			log.Infof("Removed deleted schedule ID: %d", scheduleID)
 		}
 	}
+
+	// Log current active schedules
+	log.Infof("Active schedules: %d", len(s.jobs))
+	for id, job := range s.jobs {
+		var schedule models.CheckSchedule
+		if err := s.db.First(&schedule, id).Error; err == nil {
+			nextRun := job.NextScheduledTime()
+			log.Debugf("  - %s: next run at %s", schedule.Name, nextRun.Format("2006-01-02 15:04:05"))
+		}
+	}
 }
 
 // parseCronExpression parses cron expression to gocron job
@@ -667,34 +772,180 @@ func (s *CheckScheduler) parseCronExpression(expr string) (*gocron.Job, error) {
 	case "@monthly":
 		return s.scheduler.Every(30).Days().At("09:00"), nil
 	default:
+		// Check for custom formats first
+		if strings.HasPrefix(expr, "WEEKLY:") {
+			// Format: WEEKLY:DAY:HH:MM (e.g., WEEKLY:5:16:30 = Friday at 16:30)
+			parts := strings.Split(expr, ":")
+			if len(parts) == 4 {
+				day, dayErr := strconv.Atoi(parts[1])
+				hour, hourErr := strconv.Atoi(parts[2])
+				minute, minuteErr := strconv.Atoi(parts[3])
+
+				if dayErr == nil && hourErr == nil && minuteErr == nil &&
+					day >= 0 && day <= 7 && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 {
+
+					timeStr := fmt.Sprintf("%02d:%02d", hour, minute)
+					var job *gocron.Job
+
+					switch day {
+					case 0, 7:
+						job = s.scheduler.Every(1).Sunday()
+					case 1:
+						job = s.scheduler.Every(1).Monday()
+					case 2:
+						job = s.scheduler.Every(1).Tuesday()
+					case 3:
+						job = s.scheduler.Every(1).Wednesday()
+					case 4:
+						job = s.scheduler.Every(1).Thursday()
+					case 5:
+						job = s.scheduler.Every(1).Friday()
+					case 6:
+						job = s.scheduler.Every(1).Saturday()
+					}
+
+					if job != nil {
+						job = job.At(timeStr)
+						s.log.Debugf("Creating job: Weekly on day %d at %s", day, timeStr)
+						return job, nil
+					}
+				}
+			}
+		} else if strings.HasPrefix(expr, "DAILY:") {
+			// Format: DAILY:HH:MM (e.g., DAILY:14:30)
+			parts := strings.Split(expr, ":")
+			if len(parts) == 3 {
+				hour, hourErr := strconv.Atoi(parts[1])
+				minute, minuteErr := strconv.Atoi(parts[2])
+
+				if hourErr == nil && minuteErr == nil &&
+					hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 {
+
+					timeStr := fmt.Sprintf("%02d:%02d", hour, minute)
+					s.log.Debugf("Creating job: Daily at %s", timeStr)
+					return s.scheduler.Every(1).Day().At(timeStr), nil
+				}
+			}
+		} else if strings.HasPrefix(expr, "INTERVAL:") {
+			// Format: INTERVAL:MINUTES (e.g., INTERVAL:10 = every 10 minutes)
+			parts := strings.Split(expr, ":")
+			if len(parts) == 2 {
+				minutes, err := strconv.Atoi(parts[1])
+				if err == nil && minutes > 0 {
+					s.log.Debugf("Creating job: Every %d minutes", minutes)
+					return s.scheduler.Every(uint64(minutes)).Minutes(), nil
+				}
+			}
+		}
+
 		// Parse standard cron format
 		parts := strings.Fields(expr)
 
 		if len(parts) >= 5 {
 			minute := parts[0]
 			hour := parts[1]
+			dayOfMonth := parts[2]
+			month := parts[3]
+			dayOfWeek := parts[4]
 
-			// Daily at specific time
-			if minute != "*" && hour != "*" && parts[2] == "*" && parts[3] == "*" && parts[4] == "*" {
-				m, _ := strconv.Atoi(minute)
-				h, _ := strconv.Atoi(hour)
-				timeStr := fmt.Sprintf("%02d:%02d", h, m)
-				return s.scheduler.Every(1).Day().At(timeStr), nil
+			// Every N minutes (e.g., */10 * * * *)
+			if strings.HasPrefix(minute, "*/") && hour == "*" && dayOfMonth == "*" && month == "*" && dayOfWeek == "*" {
+				intervalStr := strings.TrimPrefix(minute, "*/")
+				if interval, err := strconv.Atoi(intervalStr); err == nil && interval > 0 {
+					s.log.Debugf("Creating job: Every %d minutes", interval)
+					return s.scheduler.Every(uint64(interval)).Minutes(), nil
+				}
 			}
 
-			// Every N hours
-			if strings.HasPrefix(hour, "*/") {
+			// Every N hours (e.g., 0 */6 * * *)
+			if minute == "0" && strings.HasPrefix(hour, "*/") && dayOfMonth == "*" && month == "*" && dayOfWeek == "*" {
 				intervalStr := strings.TrimPrefix(hour, "*/")
 				if interval, err := strconv.Atoi(intervalStr); err == nil && interval > 0 {
+					s.log.Debugf("Creating job: Every %d hours", interval)
 					return s.scheduler.Every(uint64(interval)).Hours(), nil
 				}
 			}
 
-			// Every N minutes
-			if strings.HasPrefix(minute, "*/") && hour == "*" {
-				intervalStr := strings.TrimPrefix(minute, "*/")
-				if interval, err := strconv.Atoi(intervalStr); err == nil && interval > 0 {
-					return s.scheduler.Every(uint64(interval)).Minutes(), nil
+			// Specific minute every hour (e.g., 30 * * * *)
+			if minute != "*" && !strings.Contains(minute, "/") && hour == "*" && dayOfMonth == "*" && month == "*" && dayOfWeek == "*" {
+				if m, err := strconv.Atoi(minute); err == nil && m >= 0 && m <= 59 {
+					s.log.Debugf("Creating job: At minute %d of every hour", m)
+					// gocron doesn't support "at minute X of every hour" directly, so we use hourly
+					return s.scheduler.Every(1).Hour(), nil
+				}
+			}
+
+			// Daily at specific time (e.g., 30 14 * * *)
+			if minute != "*" && hour != "*" && dayOfMonth == "*" && month == "*" && dayOfWeek == "*" {
+				m, mErr := strconv.Atoi(minute)
+				h, hErr := strconv.Atoi(hour)
+				if mErr == nil && hErr == nil && m >= 0 && m <= 59 && h >= 0 && h <= 23 {
+					timeStr := fmt.Sprintf("%02d:%02d", h, m)
+					s.log.Debugf("Creating job: Daily at %s", timeStr)
+					return s.scheduler.Every(1).Day().At(timeStr), nil
+				}
+			}
+
+			// Weekly on specific day (simplified - just check if dayOfWeek is a number)
+			if dayOfWeek != "*" && dayOfMonth == "*" {
+				if dow, err := strconv.Atoi(dayOfWeek); err == nil && dow >= 0 && dow <= 7 {
+					// Map cron day (0-7, where 0 and 7 are Sunday) to gocron
+					var job *gocron.Job
+					switch dow {
+					case 0, 7:
+						job = s.scheduler.Every(1).Sunday()
+					case 1:
+						job = s.scheduler.Every(1).Monday()
+					case 2:
+						job = s.scheduler.Every(1).Tuesday()
+					case 3:
+						job = s.scheduler.Every(1).Wednesday()
+					case 4:
+						job = s.scheduler.Every(1).Thursday()
+					case 5:
+						job = s.scheduler.Every(1).Friday()
+					case 6:
+						job = s.scheduler.Every(1).Saturday()
+					}
+
+					if job != nil {
+						// Set time if specified
+						if minute != "*" && hour != "*" {
+							m, _ := strconv.Atoi(minute)
+							h, _ := strconv.Atoi(hour)
+							timeStr := fmt.Sprintf("%02d:%02d", h, m)
+							job = job.At(timeStr)
+						}
+						s.log.Debugf("Creating job: Weekly on day %d", dow)
+						return job, nil
+					}
+				}
+			}
+
+			// Every N minutes with offset (e.g., 5,15,25,35,45,55 * * * * for every 10 minutes starting at 5)
+			if strings.Contains(minute, ",") && hour == "*" && dayOfMonth == "*" && month == "*" && dayOfWeek == "*" {
+				// Try to detect pattern
+				minutes := strings.Split(minute, ",")
+				if len(minutes) >= 2 {
+					// Check if it's a regular interval
+					firstMin, _ := strconv.Atoi(minutes[0])
+					secondMin, _ := strconv.Atoi(minutes[1])
+					interval := secondMin - firstMin
+
+					isRegular := true
+					for i := 1; i < len(minutes)-1; i++ {
+						curr, _ := strconv.Atoi(minutes[i])
+						next, _ := strconv.Atoi(minutes[i+1])
+						if next-curr != interval {
+							isRegular = false
+							break
+						}
+					}
+
+					if isRegular && interval > 0 {
+						s.log.Debugf("Creating job: Every %d minutes (starting at minute %d)", interval, firstMin)
+						return s.scheduler.Every(uint64(interval)).Minutes(), nil
+					}
 				}
 			}
 		}

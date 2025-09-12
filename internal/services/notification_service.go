@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/smtp"
 	"spam-checker/internal/logger"
 	"spam-checker/internal/models"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -51,7 +54,14 @@ func (s *NotificationService) SendNotification(subject, message string) error {
 		return fmt.Errorf("failed to get active notifications: %w", err)
 	}
 
+	if len(notifications) == 0 {
+		log.Warn("No active notification channels configured")
+		return nil
+	}
+
 	var errors []string
+	successCount := 0
+
 	for _, notification := range notifications {
 		var err error
 		switch notification.Type {
@@ -65,21 +75,36 @@ func (s *NotificationService) SendNotification(subject, message string) error {
 		}
 
 		if err != nil {
-			errors = append(errors, fmt.Sprintf("%s: %v", notification.Type, err))
-			log.Errorf("Failed to send %s notification: %v", notification.Type, err)
+			// Check if it's a configuration error (don't log as error)
+			if strings.Contains(err.Error(), "invalid bot token") ||
+				strings.Contains(err.Error(), "forbidden") ||
+				strings.Contains(err.Error(), "bad request") {
+				log.Warnf("Notification configuration issue for %s: %v", notification.Type, err)
+				errors = append(errors, fmt.Sprintf("%s (config issue): %v", notification.Type, err))
+			} else {
+				// Temporary error
+				errors = append(errors, fmt.Sprintf("%s: %v", notification.Type, err))
+				log.Errorf("Failed to send %s notification: %v", notification.Type, err)
+			}
 		} else {
+			successCount++
 			log.Infof("Sent %s notification successfully", notification.Type)
 		}
 	}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("notification errors: %s", strings.Join(errors, "; "))
+	// Return error only if ALL notifications failed
+	if successCount == 0 && len(errors) > 0 {
+		return fmt.Errorf("all notifications failed: %s", strings.Join(errors, "; "))
+	} else if len(errors) > 0 {
+		// Some succeeded, some failed - just log warning
+		log.Warnf("Some notifications failed (%d/%d succeeded): %s",
+			successCount, len(notifications), strings.Join(errors, "; "))
 	}
 
 	return nil
 }
 
-// sendTelegramNotification sends notification via Telegram
+// sendTelegramNotification sends notification via Telegram with retry
 func (s *NotificationService) sendTelegramNotification(configJSON string, message string) error {
 	var config TelegramConfig
 	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
@@ -105,18 +130,93 @@ func (s *NotificationService) sendTelegramNotification(configJSON string, messag
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Send request
-	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return fmt.Errorf("failed to send telegram message: %w", err)
-	}
-	defer resp.Body.Close()
+	// Retry logic
+	maxRetries := 3
+	var lastError error
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram API returned status %d", resp.StatusCode)
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Create HTTP client with timeout
+		client := &http.Client{
+			Timeout: 30 * time.Second,
+		}
+
+		// Send request
+		resp, err := client.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+		if err != nil {
+			lastError = fmt.Errorf("failed to send telegram message (attempt %d/%d): %w", attempt, maxRetries, err)
+			s.log.Warnf("Telegram API request failed: %v", lastError)
+
+			// Wait before retry
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			}
+			continue
+		}
+		defer resp.Body.Close()
+
+		// Read response body for debugging
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyString := string(bodyBytes)
+
+		// Check response status
+		switch resp.StatusCode {
+		case http.StatusOK:
+			// Success
+			s.log.Debug("Telegram notification sent successfully")
+			return nil
+
+		case http.StatusBadRequest:
+			// Client error - don't retry
+			return fmt.Errorf("telegram API bad request (400): %s", bodyString)
+
+		case http.StatusUnauthorized:
+			// Invalid token - don't retry
+			return fmt.Errorf("telegram API unauthorized (401): invalid bot token")
+
+		case http.StatusForbidden:
+			// Bot blocked or chat not found - don't retry
+			return fmt.Errorf("telegram API forbidden (403): %s", bodyString)
+
+		case http.StatusNotFound:
+			// Method not found - don't retry
+			return fmt.Errorf("telegram API not found (404): %s", bodyString)
+
+		case http.StatusTooManyRequests:
+			// Rate limited - retry with exponential backoff
+			retryAfter := resp.Header.Get("Retry-After")
+			waitTime := time.Duration(attempt) * 5 * time.Second
+
+			if retryAfter != "" {
+				if seconds, err := strconv.Atoi(retryAfter); err == nil {
+					waitTime = time.Duration(seconds) * time.Second
+				}
+			}
+
+			lastError = fmt.Errorf("telegram API rate limited (429), retry after %v", waitTime)
+			s.log.Warnf("Telegram API rate limited: %v", lastError)
+
+			if attempt < maxRetries {
+				time.Sleep(waitTime)
+			}
+			continue
+
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			// Server errors - retry
+			lastError = fmt.Errorf("telegram API server error (%d): %s", resp.StatusCode, bodyString)
+			s.log.Warnf("Telegram API server error: %v", lastError)
+
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt) * 3 * time.Second)
+			}
+			continue
+
+		default:
+			// Unknown error - don't retry
+			return fmt.Errorf("telegram API returned unexpected status %d: %s", resp.StatusCode, bodyString)
+		}
 	}
 
-	return nil
+	return fmt.Errorf("failed after %d attempts: %w", maxRetries, lastError)
 }
 
 // sendEmailNotification sends notification via email
