@@ -26,10 +26,16 @@ type CheckScheduler struct {
 	cfg                 *config.Config
 	log                 *logrus.Entry
 	defaultIntervalJob  *gocron.Job
-	currentInterval     int // Track current interval to avoid recreating
+	currentInterval     int
 	isRunning           bool
-	runningMutex        sync.Mutex
+	runningMutex        sync.RWMutex
 	stopChan            chan struct{}
+
+	// Global check mutex to prevent concurrent checks
+	checkMutex       sync.Mutex
+	isCheckingNow    bool
+	lastCheckTime    time.Time
+	minCheckInterval time.Duration // Minimum time between checks
 }
 
 func NewCheckScheduler(db *gorm.DB, checkService *services.CheckService, phoneService *services.PhoneService, notificationService *services.NotificationService, cfg *config.Config) *CheckScheduler {
@@ -42,9 +48,11 @@ func NewCheckScheduler(db *gorm.DB, checkService *services.CheckService, phoneSe
 		jobs:                make(map[uint]*gocron.Job),
 		cfg:                 cfg,
 		log:                 logger.WithField("service", "CheckScheduler"),
-		currentInterval:     -1, // Initialize with invalid value
+		currentInterval:     -1,
 		isRunning:           false,
 		stopChan:            make(chan struct{}),
+		isCheckingNow:       false,
+		minCheckInterval:    5 * time.Minute, // Minimum 5 minutes between checks
 	}
 }
 
@@ -117,8 +125,257 @@ func (s *CheckScheduler) Stop() {
 	s.currentInterval = -1
 	s.defaultIntervalJob = nil
 	s.jobs = make(map[uint]*gocron.Job)
+	s.isCheckingNow = false
 
 	log.Info("Check scheduler stopped")
+}
+
+// canStartCheck checks if we can start a new check
+func (s *CheckScheduler) canStartCheck() bool {
+	s.checkMutex.Lock()
+	defer s.checkMutex.Unlock()
+
+	// Check if already checking
+	if s.isCheckingNow {
+		s.log.Warn("Check already in progress, skipping")
+		return false
+	}
+
+	// Check minimum interval
+	if time.Since(s.lastCheckTime) < s.minCheckInterval {
+		s.log.Warnf("Too soon since last check (%v ago), skipping", time.Since(s.lastCheckTime))
+		return false
+	}
+
+	// Mark as checking
+	s.isCheckingNow = true
+	s.lastCheckTime = time.Now()
+	return true
+}
+
+// markCheckComplete marks check as complete
+func (s *CheckScheduler) markCheckComplete() {
+	s.checkMutex.Lock()
+	defer s.checkMutex.Unlock()
+	s.isCheckingNow = false
+}
+
+// runDefaultCheck runs the default interval check
+func (s *CheckScheduler) runDefaultCheck() {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "runDefaultCheck",
+	})
+
+	// Check if we can start
+	if !s.canStartCheck() {
+		return
+	}
+	defer s.markCheckComplete()
+
+	log.Info("Starting default interval check")
+
+	// Perform the check with unified method
+	s.performPhoneCheck("default", 0)
+}
+
+// runScheduledCheck runs a scheduled check
+func (s *CheckScheduler) runScheduledCheck(scheduleID uint) {
+	log := s.log.WithFields(logrus.Fields{
+		"method":     "runScheduledCheck",
+		"scheduleID": scheduleID,
+	})
+
+	// Check if we can start
+	if !s.canStartCheck() {
+		return
+	}
+	defer s.markCheckComplete()
+
+	log.Infof("Starting scheduled check ID: %d", scheduleID)
+
+	// Update last run time
+	now := time.Now()
+	if err := s.db.Model(&models.CheckSchedule{}).Where("id = ?", scheduleID).Update("last_run", &now).Error; err != nil {
+		log.Errorf("Failed to update last run time: %v", err)
+	}
+
+	// Perform the check with unified method
+	s.performPhoneCheck("scheduled", scheduleID)
+
+	// Update next run time
+	if job, exists := s.jobs[scheduleID]; exists {
+		nextRun := job.NextScheduledTime()
+		s.db.Model(&models.CheckSchedule{}).Where("id = ?", scheduleID).Update("next_run", &nextRun)
+	}
+}
+
+// performPhoneCheck performs the actual phone checking with proper result aggregation
+func (s *CheckScheduler) performPhoneCheck(checkType string, scheduleID uint) {
+	log := s.log.WithFields(logrus.Fields{
+		"method":     "performPhoneCheck",
+		"checkType":  checkType,
+		"scheduleID": scheduleID,
+	})
+
+	startTime := time.Now()
+
+	// Get active phones
+	phones, err := s.phoneService.GetActivePhones()
+	if err != nil {
+		log.Errorf("Failed to get active phones: %v", err)
+		return
+	}
+
+	if len(phones) == 0 {
+		log.Info("No active phones to check")
+		return
+	}
+
+	log.Infof("Starting check for %d phones", len(phones))
+
+	// Track all results for single notification
+	allResults := make(map[uint][]models.CheckResult)
+	totalSpamCount := 0
+	successCount := 0
+	var checkErrors []error
+
+	// Check each phone sequentially to avoid conflicts
+	for _, phone := range phones {
+		// Check if we're stopping
+		select {
+		case <-s.stopChan:
+			log.Info("Scheduler stopping, aborting check")
+			return
+		default:
+		}
+
+		// Perform check with timeout
+		checkDone := make(chan error, 1)
+		go func(p models.PhoneNumber) {
+			checkDone <- s.checkService.CheckPhoneNumber(p.ID)
+		}(phone)
+
+		select {
+		case err := <-checkDone:
+			if err != nil {
+				// Check if it's a "already checking" error
+				if strings.Contains(err.Error(), "already being checked") {
+					log.Debugf("Phone %s is already being checked by another process", phone.Number)
+					// Don't count this as an error
+				} else {
+					log.Errorf("Failed to check phone %s: %v", phone.Number, err)
+					checkErrors = append(checkErrors, err)
+				}
+			} else {
+				successCount++
+				// Get latest results for this phone
+				checkResults, err := s.checkService.GetCheckResults(phone.ID, 0, 10)
+				if err == nil && len(checkResults) > 0 {
+					allResults[phone.ID] = checkResults
+
+					// Check if any service detected spam
+					for _, result := range checkResults {
+						if result.IsSpam {
+							totalSpamCount++
+							break // Count each phone only once
+						}
+					}
+				}
+			}
+		case <-time.After(30 * time.Second):
+			log.Warnf("Check timeout for phone %s", phone.Number)
+			checkErrors = append(checkErrors, fmt.Errorf("timeout checking phone %s", phone.Number))
+		case <-s.stopChan:
+			log.Info("Scheduler stopping, aborting check")
+			return
+		}
+
+		// Small delay between checks
+		time.Sleep(1 * time.Second)
+	}
+
+	// Calculate duration
+	duration := time.Since(startTime)
+
+	// Log summary
+	log.Infof("%s check completed in %v. Checked %d phones, found %d spam, %d succeeded, %d errors",
+		checkType, duration, len(phones), totalSpamCount, successCount, len(checkErrors))
+
+	// Send single consolidated notification if spam found
+	if totalSpamCount > 0 {
+		s.sendConsolidatedNotification(checkType, scheduleID, totalSpamCount, len(phones), allResults)
+	}
+}
+
+// sendConsolidatedNotification sends a single notification with all results
+func (s *CheckScheduler) sendConsolidatedNotification(checkType string, scheduleID uint, spamCount, totalCount int, results map[uint][]models.CheckResult) {
+	log := s.log.WithFields(logrus.Fields{
+		"method": "sendConsolidatedNotification",
+	})
+
+	// Build notification message
+	var title string
+	if checkType == "scheduled" && scheduleID > 0 {
+		var schedule models.CheckSchedule
+		if err := s.db.First(&schedule, scheduleID).Error; err == nil {
+			title = fmt.Sprintf("📋 %s Results", schedule.Name)
+		} else {
+			title = "📋 Результат проверки по расписанию"
+		}
+	} else {
+		title = "🔍 Результат проверки"
+	}
+
+	message := fmt.Sprintf(
+		"%s\n\n"+
+			"Всего проверенных номеров: %d\n"+
+			"Обнаружено спама: %d\n"+
+			"Чистые: %d\n",
+		title, totalCount, spamCount, totalCount-spamCount,
+	)
+
+	// Group spam results by service
+	serviceSpamMap := make(map[string][]string)
+
+	for phoneID, checkResults := range results {
+		for _, result := range checkResults {
+			if result.IsSpam {
+				var phone models.PhoneNumber
+				if err := s.db.First(&phone, phoneID).Error; err == nil {
+					serviceName := result.Service.Name
+					if serviceName == "" {
+						// Load service if not preloaded
+						var service models.SpamService
+						if err := s.db.First(&service, result.ServiceID).Error; err == nil {
+							serviceName = service.Name
+						}
+					}
+
+					keywords := []string(result.FoundKeywords)
+					phoneInfo := fmt.Sprintf("%s: %v", phone.Number, keywords)
+					serviceSpamMap[serviceName] = append(serviceSpamMap[serviceName], phoneInfo)
+				}
+			}
+		}
+	}
+
+	// Add spam details grouped by service
+	if len(serviceSpamMap) > 0 {
+		message += "\n⚠️🚨 Обнаружение спама по сервисам:\n"
+		for serviceName, phones := range serviceSpamMap {
+			message += fmt.Sprintf("\n📱 %s:\n", serviceName)
+			for _, phoneInfo := range phones {
+				message += fmt.Sprintf("  • %s\n", phoneInfo)
+			}
+		}
+	}
+
+	// Send notification
+	if err := s.notificationService.SendNotification(title, message); err != nil {
+		log.Errorf("Failed to send notification: %v", err)
+	} else {
+		log.Info("Notification sent successfully")
+	}
 }
 
 // checkForConfigurationChanges checks if configuration has changed and reloads if necessary
@@ -140,7 +397,7 @@ func (s *CheckScheduler) checkForConfigurationChanges() {
 		}
 	}
 
-	// Reload custom schedules (check for changes)
+	// Reload custom schedules
 	s.reloadCustomSchedules()
 }
 
@@ -183,166 +440,19 @@ func (s *CheckScheduler) updateDefaultIntervalCheck(intervalMinutes int) {
 	// Update current interval
 	s.currentInterval = intervalMinutes
 
-	log.Infof("Setting default interval check to every %d minutes", intervalMinutes)
+	// Update minimum check interval to be at least 1/4 of the interval
+	minInterval := time.Duration(intervalMinutes/4) * time.Minute
+	if minInterval < 5*time.Minute {
+		minInterval = 5 * time.Minute
+	}
+	s.minCheckInterval = minInterval
+
+	log.Infof("Setting default interval check to every %d minutes (min interval: %v)", intervalMinutes, minInterval)
 
 	// Create new job
 	job := s.scheduler.Every(uint64(intervalMinutes)).Minutes()
-	job.Do(s.runDefaultCheckSafe) // Use safe wrapper
+	job.Do(s.runDefaultCheck)
 	s.defaultIntervalJob = job
-}
-
-// runDefaultCheckSafe is a wrapper that prevents concurrent execution
-func (s *CheckScheduler) runDefaultCheckSafe() {
-	// Use a non-blocking check to prevent duplicate runs
-	select {
-	case <-s.stopChan:
-		// Scheduler is stopping
-		return
-	default:
-		// Continue with check
-	}
-
-	// Delegate to actual check method
-	s.runDefaultCheck()
-}
-
-// runDefaultCheck runs the default interval check
-func (s *CheckScheduler) runDefaultCheck() {
-	log := s.log.WithFields(logrus.Fields{
-		"method": "runDefaultCheck",
-	})
-
-	log.Info("Starting default interval check")
-	startTime := time.Now()
-
-	// Get active phones
-	phones, err := s.phoneService.GetActivePhones()
-	if err != nil {
-		log.Errorf("Failed to get active phones: %v", err)
-		return
-	}
-
-	if len(phones) == 0 {
-		log.Info("No active phones to check")
-		return
-	}
-
-	log.Infof("Starting check for %d phones", len(phones))
-
-	// Track results for notification
-	results := make(map[uint][]models.CheckResult)
-	spamCount := 0
-	var checkErrors []error
-
-	// Check each phone with a timeout
-	checkTimeout := 30 * time.Second // Timeout per phone
-	for _, phone := range phones {
-		// Check if we're stopping
-		select {
-		case <-s.stopChan:
-			log.Info("Scheduler stopping, aborting default check")
-			return
-		default:
-		}
-
-		// Create a channel for the check result
-		done := make(chan error, 1)
-
-		go func(p models.PhoneNumber) {
-			done <- s.checkService.CheckPhoneNumber(p.ID)
-		}(phone)
-
-		// Wait for check with timeout
-		select {
-		case err := <-done:
-			if err != nil {
-				log.Errorf("Failed to check phone %s: %v", phone.Number, err)
-				checkErrors = append(checkErrors, err)
-			} else {
-				// Get latest results
-				checkResults, err := s.checkService.GetCheckResults(phone.ID, 0, 3)
-				if err == nil && len(checkResults) > 0 {
-					results[phone.ID] = checkResults
-					for _, result := range checkResults {
-						if result.IsSpam {
-							spamCount++
-							break
-						}
-					}
-				}
-			}
-		case <-time.After(checkTimeout):
-			log.Warnf("Check timeout for phone %s", phone.Number)
-			checkErrors = append(checkErrors, fmt.Errorf("timeout checking phone %s", phone.Number))
-		case <-s.stopChan:
-			log.Info("Scheduler stopping, aborting default check")
-			return
-		}
-
-		// Small delay between checks to avoid overload
-		time.Sleep(2 * time.Second)
-	}
-
-	// Calculate duration
-	duration := time.Since(startTime)
-
-	// Send notification if spam found
-	if spamCount > 0 {
-		s.sendNotification(spamCount, len(phones), results)
-	}
-
-	log.Infof("Default interval check completed in %v. Checked %d phones, found %d spam, %d errors",
-		duration, len(phones), spamCount, len(checkErrors))
-}
-
-// reloadCustomSchedules reloads custom schedules from database
-func (s *CheckScheduler) reloadCustomSchedules() {
-	log := s.log.WithFields(logrus.Fields{
-		"method": "reloadCustomSchedules",
-	})
-
-	// Get all schedules from database
-	var schedules []models.CheckSchedule
-	if err := s.db.Find(&schedules).Error; err != nil {
-		log.Errorf("Failed to load schedules: %v", err)
-		return
-	}
-
-	// Track which schedules are in DB
-	schedulesInDB := make(map[uint]bool)
-
-	// Check for new or updated schedules
-	for _, schedule := range schedules {
-		schedulesInDB[schedule.ID] = true
-
-		if schedule.IsActive {
-			// Check if schedule already exists and is running
-			if _, exists := s.jobs[schedule.ID]; !exists {
-				// New active schedule - add it
-				if err := s.AddSchedule(&schedule); err != nil {
-					log.Errorf("Failed to add schedule %s: %v", schedule.Name, err)
-				} else {
-					log.Infof("Added new schedule: %s", schedule.Name)
-				}
-			}
-			// If it exists and is running, leave it as is
-		} else {
-			// Schedule is inactive
-			if _, exists := s.jobs[schedule.ID]; exists {
-				// Was active, now inactive - remove it
-				s.RemoveSchedule(schedule.ID)
-				log.Infof("Deactivated schedule: %s", schedule.Name)
-			}
-		}
-	}
-
-	// Remove deleted schedules (those not in DB anymore)
-	for scheduleID := range s.jobs {
-		if !schedulesInDB[scheduleID] {
-			s.RemoveSchedule(scheduleID)
-			log.Infof("Removed deleted schedule ID: %d", scheduleID)
-		}
-	}
 }
 
 // loadSchedules loads schedules from database
@@ -383,8 +493,8 @@ func (s *CheckScheduler) AddSchedule(schedule *models.CheckSchedule) error {
 		return fmt.Errorf("invalid cron expression: %w", err)
 	}
 
-	// Set job function with safe wrapper
-	job.Do(s.runScheduledCheckSafe, schedule.ID)
+	// Set job function
+	job.Do(s.runScheduledCheck, schedule.ID)
 
 	// Store job reference
 	s.jobs[schedule.ID] = job
@@ -412,177 +522,57 @@ func (s *CheckScheduler) RemoveSchedule(scheduleID uint) {
 	}
 }
 
-// UpdateSchedule updates an existing schedule
-func (s *CheckScheduler) UpdateSchedule(schedule *models.CheckSchedule) error {
-	if schedule.IsActive {
-		return s.AddSchedule(schedule)
-	} else {
-		s.RemoveSchedule(schedule.ID)
-		return nil
-	}
-}
-
-// runScheduledCheckSafe is a wrapper that prevents concurrent execution
-func (s *CheckScheduler) runScheduledCheckSafe(scheduleID uint) {
-	// Check if scheduler is stopping
-	select {
-	case <-s.stopChan:
-		return
-	default:
-	}
-
-	s.runScheduledCheck(scheduleID)
-}
-
-// runScheduledCheck runs a scheduled check
-func (s *CheckScheduler) runScheduledCheck(scheduleID uint) {
+// reloadCustomSchedules reloads custom schedules from database
+func (s *CheckScheduler) reloadCustomSchedules() {
 	log := s.log.WithFields(logrus.Fields{
-		"method":     "runScheduledCheck",
-		"scheduleID": scheduleID,
+		"method": "reloadCustomSchedules",
 	})
 
-	log.Infof("Starting scheduled check ID: %d", scheduleID)
-	startTime := time.Now()
-
-	// Update last run time
-	now := time.Now()
-	if err := s.db.Model(&models.CheckSchedule{}).Where("id = ?", scheduleID).Update("last_run", &now).Error; err != nil {
-		log.Errorf("Failed to update last run time: %v", err)
-	}
-
-	// Get active phones
-	phones, err := s.phoneService.GetActivePhones()
-	if err != nil {
-		log.Errorf("Failed to get active phones: %v", err)
+	// Get all schedules from database
+	var schedules []models.CheckSchedule
+	if err := s.db.Find(&schedules).Error; err != nil {
+		log.Errorf("Failed to load schedules: %v", err)
 		return
 	}
 
-	if len(phones) == 0 {
-		log.Info("No active phones to check")
-		return
-	}
+	// Track which schedules are in DB
+	schedulesInDB := make(map[uint]bool)
 
-	log.Infof("Starting check for %d phones", len(phones))
+	// Check for new or updated schedules
+	for _, schedule := range schedules {
+		schedulesInDB[schedule.ID] = true
 
-	// Track results for notification
-	results := make(map[uint][]models.CheckResult)
-	spamCount := 0
-	var checkErrors []error
-
-	// Check each phone with timeout
-	checkTimeout := 30 * time.Second
-	for _, phone := range phones {
-		// Check if we're stopping
-		select {
-		case <-s.stopChan:
-			log.Info("Scheduler stopping, aborting scheduled check")
-			return
-		default:
-		}
-
-		// Create a channel for the check result
-		done := make(chan error, 1)
-
-		go func(p models.PhoneNumber) {
-			done <- s.checkService.CheckPhoneNumber(p.ID)
-		}(phone)
-
-		// Wait for check with timeout
-		select {
-		case err := <-done:
-			if err != nil {
-				log.Errorf("Failed to check phone %s: %v", phone.Number, err)
-				checkErrors = append(checkErrors, err)
-			} else {
-				// Get latest results
-				checkResults, err := s.checkService.GetCheckResults(phone.ID, 0, 3)
-				if err == nil && len(checkResults) > 0 {
-					results[phone.ID] = checkResults
-					for _, result := range checkResults {
-						if result.IsSpam {
-							spamCount++
-							break
-						}
-					}
+		if schedule.IsActive {
+			// Check if schedule already exists and is running
+			if _, exists := s.jobs[schedule.ID]; !exists {
+				// New active schedule - add it
+				if err := s.AddSchedule(&schedule); err != nil {
+					log.Errorf("Failed to add schedule %s: %v", schedule.Name, err)
+				} else {
+					log.Infof("Added new schedule: %s", schedule.Name)
 				}
 			}
-		case <-time.After(checkTimeout):
-			log.Warnf("Check timeout for phone %s", phone.Number)
-			checkErrors = append(checkErrors, fmt.Errorf("timeout checking phone %s", phone.Number))
-		case <-s.stopChan:
-			log.Info("Scheduler stopping, aborting scheduled check")
-			return
-		}
-
-		// Small delay between checks
-		time.Sleep(2 * time.Second)
-	}
-
-	// Calculate duration
-	duration := time.Since(startTime)
-
-	// Send notification if spam found
-	if spamCount > 0 {
-		s.sendNotification(spamCount, len(phones), results)
-	}
-
-	// Update next run time
-	if job, exists := s.jobs[scheduleID]; exists {
-		nextRun := job.NextScheduledTime()
-		s.db.Model(&models.CheckSchedule{}).Where("id = ?", scheduleID).Update("next_run", &nextRun)
-	}
-
-	log.Infof("Scheduled check completed in %v. Checked %d phones, found %d spam, %d errors",
-		duration, len(phones), spamCount, len(checkErrors))
-}
-
-// sendNotification sends notification about check results
-func (s *CheckScheduler) sendNotification(spamCount, totalCount int, results map[uint][]models.CheckResult) {
-	log := s.log.WithFields(logrus.Fields{
-		"method": "sendNotification",
-	})
-
-	message := fmt.Sprintf(
-		"🔍 Check Results\n\n"+
-			"Total phones checked: %d\n"+
-			"Spam detected: %d\n"+
-			"Clean: %d\n",
-		totalCount, spamCount, totalCount-spamCount,
-	)
-
-	// Add details about spam phones
-	if spamCount > 0 {
-		message += "\n⚠️ Spam Numbers:\n"
-		for phoneID, checkResults := range results {
-			for _, result := range checkResults {
-				if result.IsSpam {
-					var phone models.PhoneNumber
-					if err := s.db.First(&phone, phoneID).Error; err == nil {
-						message += fmt.Sprintf("• %s (%s): %v\n",
-							phone.Number,
-							result.Service.Name,
-							result.FoundKeywords,
-						)
-					}
-					break
-				}
+		} else {
+			// Schedule is inactive
+			if _, exists := s.jobs[schedule.ID]; exists {
+				// Was active, now inactive - remove it
+				s.RemoveSchedule(schedule.ID)
+				log.Infof("Deactivated schedule: %s", schedule.Name)
 			}
 		}
 	}
 
-	// Send to all active notification channels
-	if err := s.notificationService.SendNotification("Check Results", message); err != nil {
-		log.Errorf("Failed to send notification: %v", err)
+	// Remove deleted schedules
+	for scheduleID := range s.jobs {
+		if !schedulesInDB[scheduleID] {
+			s.RemoveSchedule(scheduleID)
+			log.Infof("Removed deleted schedule ID: %d", scheduleID)
+		}
 	}
 }
 
 // parseCronExpression parses cron expression to gocron job
 func (s *CheckScheduler) parseCronExpression(expr string) (*gocron.Job, error) {
-	log := s.log.WithFields(logrus.Fields{
-		"method":     "parseCronExpression",
-		"expression": expr,
-	})
-
 	// Common patterns
 	switch expr {
 	case "@hourly":
@@ -592,197 +582,44 @@ func (s *CheckScheduler) parseCronExpression(expr string) (*gocron.Job, error) {
 	case "@weekly":
 		return s.scheduler.Every(1).Week().At("09:00"), nil
 	case "@monthly":
-		// gocron doesn't support monthly directly, use 30 days
 		return s.scheduler.Every(30).Days().At("09:00"), nil
 	default:
-		// Parse standard cron format and custom formats
+		// Parse standard cron format
 		parts := strings.Fields(expr)
 
-		// Check for weekly schedule with time (e.g., "WEEKLY:1,3,5:14:30" - Monday, Wednesday, Friday at 14:30)
-		if strings.HasPrefix(expr, "WEEKLY:") {
-			return s.parseWeeklySchedule(expr)
-		}
+		if len(parts) >= 5 {
+			minute := parts[0]
+			hour := parts[1]
 
-		// Check for daily schedule with time (e.g., "DAILY:14:30")
-		if strings.HasPrefix(expr, "DAILY:") {
-			return s.parseDailySchedule(expr)
-		}
+			// Daily at specific time
+			if minute != "*" && hour != "*" && parts[2] == "*" && parts[3] == "*" && parts[4] == "*" {
+				m, _ := strconv.Atoi(minute)
+				h, _ := strconv.Atoi(hour)
+				timeStr := fmt.Sprintf("%02d:%02d", h, m)
+				return s.scheduler.Every(1).Day().At(timeStr), nil
+			}
 
-		if len(parts) < 5 {
-			// Try to parse simple formats
-			if strings.HasPrefix(expr, "*/") {
-				// Every N minutes/hours format
-				if strings.Contains(expr, "* * * *") {
-					// Extract interval
-					intervalStr := strings.TrimPrefix(strings.Split(expr, " ")[1], "*/")
-					if interval, err := strconv.Atoi(intervalStr); err == nil && interval > 0 {
-						log.Infof("Parsed as every %d hours", interval)
-						return s.scheduler.Every(uint64(interval)).Hours(), nil
-					}
-				} else if strings.Contains(expr, "* * *") {
-					// Minutes format
-					intervalStr := strings.TrimPrefix(strings.Split(expr, " ")[0], "*/")
-					if interval, err := strconv.Atoi(intervalStr); err == nil && interval > 0 {
-						log.Infof("Parsed as every %d minutes", interval)
-						return s.scheduler.Every(uint64(interval)).Minutes(), nil
-					}
+			// Every N hours
+			if strings.HasPrefix(hour, "*/") {
+				intervalStr := strings.TrimPrefix(hour, "*/")
+				if interval, err := strconv.Atoi(intervalStr); err == nil && interval > 0 {
+					return s.scheduler.Every(uint64(interval)).Hours(), nil
+				}
+			}
+
+			// Every N minutes
+			if strings.HasPrefix(minute, "*/") && hour == "*" {
+				intervalStr := strings.TrimPrefix(minute, "*/")
+				if interval, err := strconv.Atoi(intervalStr); err == nil && interval > 0 {
+					return s.scheduler.Every(uint64(interval)).Minutes(), nil
 				}
 			}
 		}
 
-		// Handle specific cron patterns
-		minute := parts[0]
-		hour := parts[1]
-
-		// Daily at specific time
-		if minute != "*" && hour != "*" && len(parts) >= 5 && parts[2] == "*" && parts[3] == "*" && parts[4] == "*" {
-			// Format: "30 14 * * *" - daily at 14:30
-			m, _ := strconv.Atoi(minute)
-			h, _ := strconv.Atoi(hour)
-			timeStr := fmt.Sprintf("%02d:%02d", h, m)
-			log.Infof("Parsed as daily at %s", timeStr)
-			return s.scheduler.Every(1).Day().At(timeStr), nil
-		}
-
-		// Weekly at specific day and time
-		if minute != "*" && hour != "*" && len(parts) >= 5 && parts[2] == "*" && parts[3] == "*" && parts[4] != "*" {
-			// Format: "30 14 * * 1" - every Monday at 14:30
-			m, _ := strconv.Atoi(minute)
-			h, _ := strconv.Atoi(hour)
-			dayOfWeek, _ := strconv.Atoi(parts[4])
-			timeStr := fmt.Sprintf("%02d:%02d", h, m)
-
-			return s.parseWeekdaySchedule(dayOfWeek, timeStr)
-		}
-
-		// Every N hours at specific minute
-		if minute != "*" && strings.HasPrefix(hour, "*/") {
-			// Format: "0 */6 * * *" - every 6 hours at minute 0
-			intervalStr := strings.TrimPrefix(hour, "*/")
-			if interval, err := strconv.Atoi(intervalStr); err == nil && interval > 0 {
-				log.Infof("Parsed as every %d hours", interval)
-				return s.scheduler.Every(uint64(interval)).Hours(), nil
-			}
-		}
-
-		// Every N minutes
-		if strings.HasPrefix(minute, "*/") && hour == "*" {
-			// Format: "*/30 * * * *" - every 30 minutes
-			intervalStr := strings.TrimPrefix(minute, "*/")
-			if interval, err := strconv.Atoi(intervalStr); err == nil && interval > 0 {
-				log.Infof("Parsed as every %d minutes", interval)
-				return s.scheduler.Every(uint64(interval)).Minutes(), nil
-			}
-		}
-
-		// Specific hour every day
-		if minute == "0" && hour != "*" && !strings.Contains(hour, "/") {
-			// Format: "0 14 * * *" - daily at 14:00
-			h, _ := strconv.Atoi(hour)
-			timeStr := fmt.Sprintf("%02d:00", h)
-			log.Infof("Parsed as daily at %s", timeStr)
-			return s.scheduler.Every(1).Day().At(timeStr), nil
-		}
-
-		log.Warnf("Could not parse cron expression '%s', defaulting to hourly", expr)
 		// Default to every hour if can't parse
+		s.log.Warnf("Could not parse cron expression '%s', defaulting to hourly", expr)
 		return s.scheduler.Every(1).Hour(), nil
 	}
-}
-
-// parseWeeklySchedule parses weekly schedule format
-// Format: "WEEKLY:1,3,5:14:30" - Monday(1), Wednesday(3), Friday(5) at 14:30
-func (s *CheckScheduler) parseWeeklySchedule(expr string) (*gocron.Job, error) {
-	parts := strings.Split(strings.TrimPrefix(expr, "WEEKLY:"), ":")
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid weekly schedule format: %s", expr)
-	}
-
-	daysStr := parts[0]
-	hour := parts[1]
-	minute := parts[2]
-
-	// Parse time
-	h, err := strconv.Atoi(hour)
-	if err != nil || h < 0 || h > 23 {
-		return nil, fmt.Errorf("invalid hour in weekly schedule: %s", hour)
-	}
-
-	m, err := strconv.Atoi(minute)
-	if err != nil || m < 0 || m > 59 {
-		return nil, fmt.Errorf("invalid minute in weekly schedule: %s", minute)
-	}
-
-	timeStr := fmt.Sprintf("%02d:%02d", h, m)
-
-	// Parse days
-	daysParts := strings.Split(daysStr, ",")
-	if len(daysParts) == 0 {
-		return nil, fmt.Errorf("no days specified in weekly schedule")
-	}
-
-	// For gocron, we need to create separate jobs for each day
-	// We'll use the first day and note that gocron has limitations here
-	firstDay, err := strconv.Atoi(daysParts[0])
-	if err != nil || firstDay < 0 || firstDay > 6 {
-		return nil, fmt.Errorf("invalid day in weekly schedule: %s", daysParts[0])
-	}
-
-	return s.parseWeekdaySchedule(firstDay, timeStr)
-}
-
-// parseDailySchedule parses daily schedule format
-// Format: "DAILY:14:30" - Every day at 14:30
-func (s *CheckScheduler) parseDailySchedule(expr string) (*gocron.Job, error) {
-	parts := strings.Split(strings.TrimPrefix(expr, "DAILY:"), ":")
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid daily schedule format: %s", expr)
-	}
-
-	hour := parts[0]
-	minute := parts[1]
-
-	h, err := strconv.Atoi(hour)
-	if err != nil || h < 0 || h > 23 {
-		return nil, fmt.Errorf("invalid hour in daily schedule: %s", hour)
-	}
-
-	m, err := strconv.Atoi(minute)
-	if err != nil || m < 0 || m > 59 {
-		return nil, fmt.Errorf("invalid minute in daily schedule: %s", minute)
-	}
-
-	timeStr := fmt.Sprintf("%02d:%02d", h, m)
-	s.log.Infof("Parsed as daily at %s", timeStr)
-
-	return s.scheduler.Every(1).Day().At(timeStr), nil
-}
-
-// parseWeekdaySchedule creates a job for specific weekday and time
-func (s *CheckScheduler) parseWeekdaySchedule(dayOfWeek int, timeStr string) (*gocron.Job, error) {
-	// Map cron day (0-6, 0=Sunday) to gocron day
-	var job *gocron.Job
-	switch dayOfWeek {
-	case 0:
-		job = s.scheduler.Every(1).Sunday().At(timeStr)
-	case 1:
-		job = s.scheduler.Every(1).Monday().At(timeStr)
-	case 2:
-		job = s.scheduler.Every(1).Tuesday().At(timeStr)
-	case 3:
-		job = s.scheduler.Every(1).Wednesday().At(timeStr)
-	case 4:
-		job = s.scheduler.Every(1).Thursday().At(timeStr)
-	case 5:
-		job = s.scheduler.Every(1).Friday().At(timeStr)
-	case 6:
-		job = s.scheduler.Every(1).Saturday().At(timeStr)
-	default:
-		return nil, fmt.Errorf("invalid day of week: %d", dayOfWeek)
-	}
-
-	s.log.Infof("Parsed as weekly on day %d at %s", dayOfWeek, timeStr)
-	return job, nil
 }
 
 // GetScheduleStatus gets status of all schedules
@@ -797,7 +634,7 @@ func (s *CheckScheduler) GetScheduleStatus() []map[string]interface{} {
 	// Add default interval check status
 	intervalMinutes := s.currentInterval
 	if intervalMinutes <= 0 {
-		intervalMinutes = 60 // default
+		intervalMinutes = 60
 	}
 
 	status = append(status, map[string]interface{}{
@@ -805,9 +642,9 @@ func (s *CheckScheduler) GetScheduleStatus() []map[string]interface{} {
 		"name":       "Default Interval Check",
 		"expression": fmt.Sprintf("Every %d minutes", intervalMinutes),
 		"is_active":  s.defaultIntervalJob != nil,
-		"last_run":   nil,
+		"last_run":   s.lastCheckTime,
 		"next_run":   nil,
-		"is_running": s.defaultIntervalJob != nil,
+		"is_running": s.isCheckingNow,
 		"is_default": true,
 	})
 
@@ -823,7 +660,6 @@ func (s *CheckScheduler) GetScheduleStatus() []map[string]interface{} {
 			"is_default": false,
 		}
 
-		// Check if job exists
 		if _, exists := s.jobs[schedule.ID]; exists {
 			item["is_running"] = true
 		} else {
@@ -838,7 +674,7 @@ func (s *CheckScheduler) GetScheduleStatus() []map[string]interface{} {
 
 // IsRunning returns whether the scheduler is running
 func (s *CheckScheduler) IsRunning() bool {
-	s.runningMutex.Lock()
-	defer s.runningMutex.Unlock()
+	s.runningMutex.RLock()
+	defer s.runningMutex.RUnlock()
 	return s.isRunning
 }
