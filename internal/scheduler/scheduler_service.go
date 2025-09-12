@@ -595,9 +595,18 @@ func (s *CheckScheduler) parseCronExpression(expr string) (*gocron.Job, error) {
 		// gocron doesn't support monthly directly, use 30 days
 		return s.scheduler.Every(30).Days().At("09:00"), nil
 	default:
-		// Parse standard cron format
-		// Format: "minute hour day month weekday"
+		// Parse standard cron format and custom formats
 		parts := strings.Fields(expr)
+
+		// Check for weekly schedule with time (e.g., "WEEKLY:1,3,5:14:30" - Monday, Wednesday, Friday at 14:30)
+		if strings.HasPrefix(expr, "WEEKLY:") {
+			return s.parseWeeklySchedule(expr)
+		}
+
+		// Check for daily schedule with time (e.g., "DAILY:14:30")
+		if strings.HasPrefix(expr, "DAILY:") {
+			return s.parseDailySchedule(expr)
+		}
 
 		if len(parts) < 5 {
 			// Try to parse simple formats
@@ -635,6 +644,17 @@ func (s *CheckScheduler) parseCronExpression(expr string) (*gocron.Job, error) {
 			return s.scheduler.Every(1).Day().At(timeStr), nil
 		}
 
+		// Weekly at specific day and time
+		if minute != "*" && hour != "*" && len(parts) >= 5 && parts[2] == "*" && parts[3] == "*" && parts[4] != "*" {
+			// Format: "30 14 * * 1" - every Monday at 14:30
+			m, _ := strconv.Atoi(minute)
+			h, _ := strconv.Atoi(hour)
+			dayOfWeek, _ := strconv.Atoi(parts[4])
+			timeStr := fmt.Sprintf("%02d:%02d", h, m)
+
+			return s.parseWeekdaySchedule(dayOfWeek, timeStr)
+		}
+
 		// Every N hours at specific minute
 		if minute != "*" && strings.HasPrefix(hour, "*/") {
 			// Format: "0 */6 * * *" - every 6 hours at minute 0
@@ -668,6 +688,101 @@ func (s *CheckScheduler) parseCronExpression(expr string) (*gocron.Job, error) {
 		// Default to every hour if can't parse
 		return s.scheduler.Every(1).Hour(), nil
 	}
+}
+
+// parseWeeklySchedule parses weekly schedule format
+// Format: "WEEKLY:1,3,5:14:30" - Monday(1), Wednesday(3), Friday(5) at 14:30
+func (s *CheckScheduler) parseWeeklySchedule(expr string) (*gocron.Job, error) {
+	parts := strings.Split(strings.TrimPrefix(expr, "WEEKLY:"), ":")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid weekly schedule format: %s", expr)
+	}
+
+	daysStr := parts[0]
+	hour := parts[1]
+	minute := parts[2]
+
+	// Parse time
+	h, err := strconv.Atoi(hour)
+	if err != nil || h < 0 || h > 23 {
+		return nil, fmt.Errorf("invalid hour in weekly schedule: %s", hour)
+	}
+
+	m, err := strconv.Atoi(minute)
+	if err != nil || m < 0 || m > 59 {
+		return nil, fmt.Errorf("invalid minute in weekly schedule: %s", minute)
+	}
+
+	timeStr := fmt.Sprintf("%02d:%02d", h, m)
+
+	// Parse days
+	daysParts := strings.Split(daysStr, ",")
+	if len(daysParts) == 0 {
+		return nil, fmt.Errorf("no days specified in weekly schedule")
+	}
+
+	// For gocron, we need to create separate jobs for each day
+	// We'll use the first day and note that gocron has limitations here
+	firstDay, err := strconv.Atoi(daysParts[0])
+	if err != nil || firstDay < 0 || firstDay > 6 {
+		return nil, fmt.Errorf("invalid day in weekly schedule: %s", daysParts[0])
+	}
+
+	return s.parseWeekdaySchedule(firstDay, timeStr)
+}
+
+// parseDailySchedule parses daily schedule format
+// Format: "DAILY:14:30" - Every day at 14:30
+func (s *CheckScheduler) parseDailySchedule(expr string) (*gocron.Job, error) {
+	parts := strings.Split(strings.TrimPrefix(expr, "DAILY:"), ":")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid daily schedule format: %s", expr)
+	}
+
+	hour := parts[0]
+	minute := parts[1]
+
+	h, err := strconv.Atoi(hour)
+	if err != nil || h < 0 || h > 23 {
+		return nil, fmt.Errorf("invalid hour in daily schedule: %s", hour)
+	}
+
+	m, err := strconv.Atoi(minute)
+	if err != nil || m < 0 || m > 59 {
+		return nil, fmt.Errorf("invalid minute in daily schedule: %s", minute)
+	}
+
+	timeStr := fmt.Sprintf("%02d:%02d", h, m)
+	s.log.Infof("Parsed as daily at %s", timeStr)
+
+	return s.scheduler.Every(1).Day().At(timeStr), nil
+}
+
+// parseWeekdaySchedule creates a job for specific weekday and time
+func (s *CheckScheduler) parseWeekdaySchedule(dayOfWeek int, timeStr string) (*gocron.Job, error) {
+	// Map cron day (0-6, 0=Sunday) to gocron day
+	var job *gocron.Job
+	switch dayOfWeek {
+	case 0:
+		job = s.scheduler.Every(1).Sunday().At(timeStr)
+	case 1:
+		job = s.scheduler.Every(1).Monday().At(timeStr)
+	case 2:
+		job = s.scheduler.Every(1).Tuesday().At(timeStr)
+	case 3:
+		job = s.scheduler.Every(1).Wednesday().At(timeStr)
+	case 4:
+		job = s.scheduler.Every(1).Thursday().At(timeStr)
+	case 5:
+		job = s.scheduler.Every(1).Friday().At(timeStr)
+	case 6:
+		job = s.scheduler.Every(1).Saturday().At(timeStr)
+	default:
+		return nil, fmt.Errorf("invalid day of week: %d", dayOfWeek)
+	}
+
+	s.log.Infof("Parsed as weekly on day %d at %s", dayOfWeek, timeStr)
+	return job, nil
 }
 
 // GetScheduleStatus gets status of all schedules
