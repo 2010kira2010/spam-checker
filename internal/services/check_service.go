@@ -2,6 +2,7 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"image/png"
@@ -30,6 +31,7 @@ type CheckService struct {
 	gatewayBusy      map[uint]bool
 	phoneCheckLocks  map[uint]*sync.Mutex
 	phoneCheckMu     sync.RWMutex
+	phoneCheckActive map[uint]bool // Track active phone checks
 	resultWriteMutex sync.Mutex
 	log              *logrus.Entry
 
@@ -38,6 +40,7 @@ type CheckService struct {
 	gatewayQueueMu sync.RWMutex
 	maxRetries     int
 	retryDelay     time.Duration
+	checkTimeout   time.Duration // Global timeout for phone check
 }
 
 // CheckTask represents a task for checking phone on specific gateway/service
@@ -47,6 +50,7 @@ type CheckTask struct {
 	GatewayID uint
 	ServiceID uint
 	Retry     int
+	Context   context.Context // Add context for cancellation
 }
 
 // CheckResult for concurrent processing
@@ -69,17 +73,19 @@ type APICheckResult struct {
 
 func NewCheckService(db *gorm.DB, cfg *config.Config) *CheckService {
 	service := &CheckService{
-		db:              db,
-		cfg:             cfg,
-		adbService:      NewADBServiceWithConfig(db, cfg),
-		apiService:      NewAPICheckService(db),
-		gatewayLocks:    make(map[uint]*sync.Mutex),
-		gatewayBusy:     make(map[uint]bool),
-		phoneCheckLocks: make(map[uint]*sync.Mutex),
-		gatewayQueue:    make(map[uint]chan struct{}),
-		log:             logger.WithField("service", "CheckService"),
-		maxRetries:      3,
-		retryDelay:      2 * time.Second,
+		db:               db,
+		cfg:              cfg,
+		adbService:       NewADBServiceWithConfig(db, cfg),
+		apiService:       NewAPICheckService(db),
+		gatewayLocks:     make(map[uint]*sync.Mutex),
+		gatewayBusy:      make(map[uint]bool),
+		phoneCheckLocks:  make(map[uint]*sync.Mutex),
+		phoneCheckActive: make(map[uint]bool),
+		gatewayQueue:     make(map[uint]chan struct{}),
+		log:              logger.WithField("service", "CheckService"),
+		maxRetries:       3,
+		retryDelay:       2 * time.Second,
+		checkTimeout:     5 * time.Minute, // Total timeout for checking one phone
 	}
 
 	// Initialize gateway queues
@@ -134,16 +140,49 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 		"phoneID": phoneID,
 	})
 
+	// Check if phone is already being checked
+	s.phoneCheckMu.Lock()
+	if s.phoneCheckActive[phoneID] {
+		s.phoneCheckMu.Unlock()
+		log.Warnf("Phone %d is already being checked, skipping", phoneID)
+		return fmt.Errorf("phone %d is already being checked", phoneID)
+	}
+	s.phoneCheckActive[phoneID] = true
+	s.phoneCheckMu.Unlock()
+
+	// Ensure we clear the active flag when done
+	defer func() {
+		s.phoneCheckMu.Lock()
+		delete(s.phoneCheckActive, phoneID)
+		s.phoneCheckMu.Unlock()
+	}()
+
 	// Get phone number
 	var phone models.PhoneNumber
 	if err := s.db.First(&phone, phoneID).Error; err != nil {
 		return fmt.Errorf("phone not found: %w", err)
 	}
 
-	// Use phone-level lock to prevent duplicate concurrent checks
+	// Use phone-level lock to serialize checks for the same phone
 	phoneCheckLock := s.getPhoneCheckLock(phoneID)
-	phoneCheckLock.Lock()
-	defer phoneCheckLock.Unlock()
+
+	// Try to acquire lock with timeout
+	lockAcquired := make(chan bool, 1)
+	go func() {
+		phoneCheckLock.Lock()
+		lockAcquired <- true
+	}()
+
+	select {
+	case <-lockAcquired:
+		defer phoneCheckLock.Unlock()
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("timeout acquiring lock for phone %d", phoneID)
+	}
+
+	// Create context with timeout for the entire phone check
+	ctx, cancel := context.WithTimeout(context.Background(), s.checkTimeout)
+	defer cancel()
 
 	// Get check mode setting
 	checkMode := s.getCheckMode()
@@ -157,10 +196,10 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 	// Perform checks based on mode
 	switch checkMode {
 	case models.CheckModeADBOnly:
-		return s.checkViaADB(&phone)
+		return s.checkViaADBWithContext(ctx, &phone)
 
 	case models.CheckModeAPIOnly:
-		return s.checkViaAPI(&phone)
+		return s.checkViaAPIWithContext(ctx, &phone)
 
 	case models.CheckModeBoth:
 		// Check both ADB and API concurrently
@@ -168,20 +207,31 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 
 		go func() {
 			defer wg.Done()
-			if err := s.checkViaADB(&phone); err != nil {
+			if err := s.checkViaADBWithContext(ctx, &phone); err != nil {
 				errChan <- fmt.Errorf("ADB: %w", err)
 			}
 		}()
 
 		go func() {
 			defer wg.Done()
-			if err := s.checkViaAPI(&phone); err != nil {
+			if err := s.checkViaAPIWithContext(ctx, &phone); err != nil {
 				errChan <- fmt.Errorf("API: %w", err)
 			}
 		}()
 
-		wg.Wait()
-		close(errChan)
+		// Wait for completion or timeout
+		done := make(chan bool)
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			close(errChan)
+		case <-ctx.Done():
+			return fmt.Errorf("check timeout for phone %s", phone.Number)
+		}
 
 		// Collect errors
 		var errors []error
@@ -201,7 +251,31 @@ func (s *CheckService) CheckPhoneNumber(phoneID uint) error {
 	}
 }
 
-// checkViaADB checks phone via ADB without retry wrapper (to avoid recursion)
+// checkViaADBWithContext checks phone via ADB with context
+func (s *CheckService) checkViaADBWithContext(ctx context.Context, phone *models.PhoneNumber) error {
+	// Check context before starting
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	return s.checkViaADB(phone)
+}
+
+// checkViaAPIWithContext checks phone via API with context
+func (s *CheckService) checkViaAPIWithContext(ctx context.Context, phone *models.PhoneNumber) error {
+	// Check context before starting
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	return s.checkViaAPI(phone)
+}
+
+// checkViaADB checks phone via ADB
 func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 	log := s.log.WithFields(logrus.Fields{
 		"method": "checkViaADB",
@@ -219,6 +293,10 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 	}
 
 	log.Infof("Starting ADB check for phone %s across %d gateways", phone.Number, len(gateways))
+
+	// Create context for this ADB check
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
 
 	// Create task channels
 	taskChan := make(chan CheckTask, len(gateways))
@@ -245,6 +323,7 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 			GatewayID: gateway.ID,
 			ServiceID: 0, // Will be resolved in worker
 			Retry:     0,
+			Context:   ctx,
 		}
 		taskChan <- task
 	}
@@ -256,22 +335,33 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 		close(resultChan)
 	}()
 
-	// Collect results
+	// Collect results with timeout
 	successCount := 0
 	errorCount := 0
 	var lastError error
 
-	for result := range resultChan {
-		if result.Error != nil {
-			errorCount++
-			lastError = result.Error
-			log.Errorf("Check failed on gateway %s: %v", result.Gateway.Name, result.Error)
-		} else {
-			successCount++
-			log.Infof("Check succeeded on gateway %s", result.Gateway.Name)
+	for {
+		select {
+		case result, ok := <-resultChan:
+			if !ok {
+				// Channel closed, all results collected
+				goto done
+			}
+			if result.Error != nil {
+				errorCount++
+				lastError = result.Error
+				log.Errorf("Check failed on gateway %s: %v", result.Gateway.Name, result.Error)
+			} else {
+				successCount++
+				log.Infof("Check succeeded on gateway %s", result.Gateway.Name)
+			}
+		case <-ctx.Done():
+			log.Errorf("ADB check timeout for phone %s", phone.Number)
+			return fmt.Errorf("ADB check timeout")
 		}
 	}
 
+done:
 	log.Infof("ADB check completed for phone %s: %d successful, %d failed",
 		phone.Number, successCount, errorCount)
 
@@ -282,7 +372,7 @@ func (s *CheckService) checkViaADB(phone *models.PhoneNumber) error {
 	return nil
 }
 
-// checkViaAPI checks phone via API without retry wrapper
+// checkViaAPI checks phone via API
 func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 	log := s.log.WithFields(logrus.Fields{
 		"method": "checkViaAPI",
@@ -301,6 +391,10 @@ func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 
 	log.Infof("Starting API check for phone %s across %d services", phone.Number, len(apiServices))
 
+	// Create context for this API check
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
 	// Create result channel
 	resultChan := make(chan APICheckResult, len(apiServices))
 	var wg sync.WaitGroup
@@ -311,16 +405,37 @@ func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 		go func(api models.APIService) {
 			defer wg.Done()
 
+			// Check context
+			select {
+			case <-ctx.Done():
+				resultChan <- APICheckResult{
+					PhoneID:    phone.ID,
+					APIService: &api,
+					Error:      ctx.Err(),
+				}
+				return
+			default:
+			}
+
 			result := APICheckResult{
 				PhoneID:    phone.ID,
 				APIService: &api,
 			}
 
-			// Perform check with retries
+			// Perform check with retries (but with context awareness)
 			var checkResult *models.CheckResult
 			var lastErr error
 
 			for retry := 0; retry <= s.maxRetries; retry++ {
+				// Check context before retry
+				select {
+				case <-ctx.Done():
+					result.Error = ctx.Err()
+					resultChan <- result
+					return
+				default:
+				}
+
 				log.Infof("Checking phone %s via API %s (attempt %d/%d)",
 					phone.Number, api.Name, retry+1, s.maxRetries+1)
 
@@ -350,14 +465,6 @@ func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 						log.Warnf("Failed to get service after check: %v", err)
 					}
 
-					// Log extracted data for debugging
-					if checkResult.RawText != "" {
-						log.Debugf("API %s extracted text: %s", api.Name, checkResult.RawText)
-					}
-					if len(checkResult.FoundKeywords) > 0 {
-						log.Debugf("API %s found keywords: %v", api.Name, []string(checkResult.FoundKeywords))
-					}
-
 					break
 				}
 			}
@@ -377,28 +484,39 @@ func (s *CheckService) checkViaAPI(phone *models.PhoneNumber) error {
 		close(resultChan)
 	}()
 
-	// Collect results
+	// Collect results with timeout
 	successCount := 0
 	errorCount := 0
 	var lastError error
 	hasSpamDetection := false
 
-	for result := range resultChan {
-		if result.Error != nil {
-			errorCount++
-			lastError = result.Error
-			log.Errorf("API check failed for %s: %v", result.APIService.Name, result.Error)
-		} else {
-			successCount++
-			log.Infof("API check succeeded for %s", result.APIService.Name)
-
-			// Check if any service detected spam
-			if result.Result != nil && result.Result.IsSpam {
-				hasSpamDetection = true
+	for {
+		select {
+		case result, ok := <-resultChan:
+			if !ok {
+				// Channel closed, all results collected
+				goto done
 			}
+			if result.Error != nil {
+				errorCount++
+				lastError = result.Error
+				log.Errorf("API check failed for %s: %v", result.APIService.Name, result.Error)
+			} else {
+				successCount++
+				log.Infof("API check succeeded for %s", result.APIService.Name)
+
+				// Check if any service detected spam
+				if result.Result != nil && result.Result.IsSpam {
+					hasSpamDetection = true
+				}
+			}
+		case <-ctx.Done():
+			log.Errorf("API check timeout for phone %s", phone.Number)
+			return fmt.Errorf("API check timeout")
 		}
 	}
 
+done:
 	log.Infof("API check completed for phone %s: %d successful, %d failed, spam detected: %v",
 		phone.Number, successCount, errorCount, hasSpamDetection)
 
@@ -414,6 +532,17 @@ func (s *CheckService) adbCheckWorker(taskChan <-chan CheckTask, resultChan chan
 	defer wg.Done()
 
 	for task := range taskChan {
+		// Check context first
+		select {
+		case <-task.Context.Done():
+			resultChan <- ConcurrentCheckResult{
+				PhoneID: task.PhoneID,
+				Error:   task.Context.Err(),
+			}
+			continue
+		default:
+		}
+
 		result := ConcurrentCheckResult{
 			PhoneID: task.PhoneID,
 		}
@@ -436,8 +565,8 @@ func (s *CheckService) adbCheckWorker(taskChan <-chan CheckTask, resultChan chan
 		}
 		result.Service = &service
 
-		// Try to perform check with retries
-		err = s.checkOnGatewayWithRetry(task.Phone, gateway, &service, task.Retry)
+		// Try to perform check with retries (non-recursive)
+		err = s.checkOnGatewayWithRetryNonRecursive(task.Context, task.Phone, gateway, &service)
 		if err != nil {
 			result.Error = err
 		} else {
@@ -453,59 +582,74 @@ func (s *CheckService) adbCheckWorker(taskChan <-chan CheckTask, resultChan chan
 	}
 }
 
-// checkOnGatewayWithRetry performs check on gateway with retry logic
-func (s *CheckService) checkOnGatewayWithRetry(phone *models.PhoneNumber, gateway *models.ADBGateway, service *models.SpamService, currentRetry int) error {
+// checkOnGatewayWithRetryNonRecursive performs check on gateway with retry logic (non-recursive)
+func (s *CheckService) checkOnGatewayWithRetryNonRecursive(ctx context.Context, phone *models.PhoneNumber, gateway *models.ADBGateway, service *models.SpamService) error {
 	log := s.log.WithFields(logrus.Fields{
-		"method":  "checkOnGatewayWithRetry",
+		"method":  "checkOnGatewayWithRetryNonRecursive",
 		"phone":   phone.Number,
 		"gateway": gateway.Name,
-		"retry":   currentRetry,
 	})
 
 	// Get gateway queue (acts as a semaphore)
 	queue := s.getGatewayQueue(gateway.ID)
 
-	// Try to acquire slot with timeout
-	maxWaitTime := 30 * time.Second
-	if currentRetry > 0 {
-		maxWaitTime = 10 * time.Second // Shorter wait on retries
-	}
+	for retry := 0; retry <= s.maxRetries; retry++ {
+		// Check context
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 
-	select {
-	case queue <- struct{}{}:
-		// Successfully acquired slot
-		defer func() { <-queue }() // Release slot when done
+		// Try to acquire slot with timeout
+		maxWaitTime := 30 * time.Second
+		if retry > 0 {
+			maxWaitTime = 10 * time.Second // Shorter wait on retries
+		}
 
-		log.Infof("Acquired gateway %s for checking %s", gateway.Name, phone.Number)
+		select {
+		case queue <- struct{}{}:
+			// Successfully acquired slot
+			log.Infof("Acquired gateway %s for checking %s (attempt %d/%d)",
+				gateway.Name, phone.Number, retry+1, s.maxRetries+1)
 
-		// Perform the actual check
-		err := s.performGatewayCheck(phone, gateway, service)
-		if err != nil {
-			// Check if we should retry
-			if currentRetry < s.maxRetries && s.isRetryableError(err) {
-				log.Warnf("Check failed on gateway %s, will retry (attempt %d/%d): %v",
-					gateway.Name, currentRetry+1, s.maxRetries, err)
+			// Perform the actual check
+			err := s.performGatewayCheck(phone, gateway, service)
 
-				time.Sleep(s.retryDelay)
-				return s.checkOnGatewayWithRetry(phone, gateway, service, currentRetry+1)
+			// Release slot
+			<-queue
+
+			if err != nil {
+				// Check if we should retry
+				if retry < s.maxRetries && s.isRetryableError(err) {
+					log.Warnf("Check failed on gateway %s, will retry: %v", gateway.Name, err)
+					time.Sleep(s.retryDelay)
+					continue // Try next iteration
+				}
+				return err
 			}
-			return err
+
+			// Success
+			return nil
+
+		case <-time.After(maxWaitTime):
+			// Timeout waiting for gateway
+			log.Warnf("Timeout waiting for gateway %s (attempt %d/%d)",
+				gateway.Name, retry+1, s.maxRetries+1)
+
+			if retry < s.maxRetries {
+				time.Sleep(s.retryDelay)
+				continue // Try next iteration
+			}
+
+			return fmt.Errorf("gateway %s is busy after %d retries", gateway.Name, s.maxRetries)
+
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-
-		return nil
-
-	case <-time.After(maxWaitTime):
-		// Timeout waiting for gateway
-		if currentRetry < s.maxRetries {
-			log.Warnf("Timeout waiting for gateway %s, retrying (attempt %d/%d)",
-				gateway.Name, currentRetry+1, s.maxRetries)
-
-			time.Sleep(s.retryDelay)
-			return s.checkOnGatewayWithRetry(phone, gateway, service, currentRetry+1)
-		}
-
-		return fmt.Errorf("gateway %s is busy after %d retries", gateway.Name, s.maxRetries)
 	}
+
+	return fmt.Errorf("failed after %d retries", s.maxRetries)
 }
 
 // performGatewayCheck performs the actual check on gateway
@@ -631,6 +775,12 @@ func (s *CheckService) isRetryableError(err error) bool {
 		"connection refused",
 		"deadline exceeded",
 		"temporary failure",
+		"context deadline exceeded", // Don't retry on context timeout
+	}
+
+	// Don't retry on context cancellation
+	if strings.Contains(errStr, "context canceled") || strings.Contains(errStr, "context deadline exceeded") {
+		return false
 	}
 
 	for _, pattern := range retryablePatterns {
@@ -706,6 +856,10 @@ func (s *CheckService) CheckAllPhones() error {
 
 	log.Infof("Starting check for %d phones with max %d concurrent checks", len(phones), maxConcurrent)
 
+	// Create context with timeout for all checks
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(len(phones))*s.checkTimeout)
+	defer cancel()
+
 	// Create work channel
 	workChan := make(chan models.PhoneNumber, len(phones))
 	for _, phone := range phones {
@@ -723,11 +877,25 @@ func (s *CheckService) CheckAllPhones() error {
 			defer wg.Done()
 
 			for phone := range workChan {
+				// Check context
+				select {
+				case <-ctx.Done():
+					log.Warnf("[Worker %d] Context cancelled, stopping", workerID)
+					errorChan <- fmt.Errorf("worker %d stopped: %w", workerID, ctx.Err())
+					return
+				default:
+				}
+
 				log.Infof("[Worker %d] Starting check for phone: %s", workerID, phone.Number)
 
 				if err := s.CheckPhoneNumber(phone.ID); err != nil {
-					errorChan <- fmt.Errorf("phone %s: %w", phone.Number, err)
-					log.Errorf("[Worker %d] Failed to check phone %s: %v", workerID, phone.Number, err)
+					// Don't count "already being checked" as error
+					if !strings.Contains(err.Error(), "already being checked") {
+						errorChan <- fmt.Errorf("phone %s: %w", phone.Number, err)
+						log.Errorf("[Worker %d] Failed to check phone %s: %v", workerID, phone.Number, err)
+					} else {
+						log.Warnf("[Worker %d] Phone %s is already being checked", workerID, phone.Number)
+					}
 				} else {
 					log.Infof("[Worker %d] Completed check for phone: %s", workerID, phone.Number)
 				}
